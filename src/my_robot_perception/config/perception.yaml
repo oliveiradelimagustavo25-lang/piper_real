@@ -1,0 +1,47 @@
+color_detector:
+  ros__parameters:
+    image_topic: /camera_sensor/image_raw
+    labels_topic: /perception/color_labels
+    debug_topic: /perception/color_debug
+    show_window: false
+    publish_debug: true
+
+    # 面积单位为像素；1 cm 小物块先使用较低阈值。
+    min_area: 12
+    max_area: 100000
+    morphology_kernel: 3        # 奇数；1 表示不做形态学处理
+
+    # OpenCV HSV：H=0~179，S/V=0~255。
+    # H 下界大于上界表示跨越色相零点，适用于红色。
+    red.lower: [170, 100, 50]
+    red.upper: [10, 255, 255]
+    green.lower: [35, 80, 50]
+    green.upper: [85, 255, 255]
+    blue.lower: [90, 80, 50]
+    blue.upper: [135, 255, 255]
+
+depth_localizer:
+  ros__parameters:
+    labels_topic: /perception/color_labels
+    # 实机需替换为对齐到彩色图的深度话题，并使用对应彩色内参。
+    depth_topic: /camera_sensor/depth/image_raw
+    camera_info_topic: /camera_sensor/camera_info
+    points_topic: /perception/object_points
+    target_frame: ""             # 空字符串：相机光学系；可改为 base_link
+    objects_topic: /perception/objects
+    objects_frame: base_link     # Z 轴向上的坐标系，物体中心位姿使用此坐标系
+    object_dimensions: [0.01, 0.01, 0.01]  # 当前三色物块的已知尺寸，m
+    top_surface_tolerance: 0.002 # 上部点的高度容差，m；要求物块平放且顶部可见
+    tf_timeout: 0.1              # s，等待采集时刻的 TF 到达，避免图像略早于关节 TF
+    sync_slop: 0.03               # RGB 标签与深度时间差上限，单位 s
+    min_depth: 0.05               # 单位 m
+    max_depth: 3.0
+    depth_tolerance: 0.02         # 保留距区域深度中值不超过此值的像素
+    min_valid_pixels: 5
+    erosion_kernel: 1            # 奇数；3 可去除边缘，1 适合当前小物块
+
+aruco_detector:
+  ros__parameters:
+    marker_size: 0.1666666667    # 黑色标记边长，单位 m，不含白边
+    show_window: false
+    binary_threshold: 160

@@ -1,0 +1,6 @@
+# SRDF 中 arm 组的命名姿态，例如 pose_1 / home。
+string target
+---
+bool success
+string message
+---

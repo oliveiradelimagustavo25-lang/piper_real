@@ -1,0 +1,12 @@
+# strategy 为空时使用配置默认值；支持 color_order / nearest。
+string strategy
+# 1=红、2=绿、3=蓝；为空时使用默认列表。
+# color_order 按此顺序分拣；nearest 使用这些颜色筛选候选物体。
+uint8[] color_order
+---
+# 表示本批 PickPlace 运动流程完成，实际放置仍需视觉复核。
+bool success
+string message
+---
+string current_object_id
+uint32 completed_count

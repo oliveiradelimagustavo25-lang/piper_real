@@ -1,0 +1,44 @@
+pick_place_executor:
+  ros__parameters:
+    action_name: /manipulation/pick_place
+    move_to_named_action: /manipulation/move_to_named
+    reference_frame: base_link
+    arm_group: arm
+    gripper_group: gripper
+    end_effector_link: link6
+    objects_topic: /perception/objects
+    touch_links: [link7, link8]
+
+    # 与 preview.xml 地面和 objects/aruco_board.xml 的尺寸、位姿保持一致。
+    scene_boxes: [ground, aruco_board]
+    scene.ground.size: [4.0, 4.0, 0.02]
+    scene.ground.position: [0.0, 0.0, -0.01]
+    scene.ground.rpy: [0.0, 0.0, 0.0]
+    scene.aruco_board.size: [0.2, 0.01, 0.2]
+    scene.aruco_board.position: [0.5, 0.0, 0.1]
+    scene.aruco_board.rpy: [0.0, 0.0, 1.57079632679]
+
+    velocity_scaling: 0.2
+    acceleration_scaling: 0.2
+    planning_time: 5.0
+    cartesian_step: 0.005         # m，下降和抬升使用直线路径
+
+    # link6 到夹持中心的平移；已通过当前 1 cm / 3 cm 物块仿真，实机需标定。
+    tool_to_tcp: [0.0, 0.0, 0.132]
+    grasp_rpy: [0.0, 3.141592653589793, 0.0]  # rad，固定向下抓取
+    # 保留指尖与地面的净空；该偏移基于当前 MuJoCo 1 cm 物块验证，实机需重新标定。
+    grasp_offset: [0.0, 0.0, 0.01]  # 物块中心到夹持中心，基座坐标系，m
+
+    approach_distance: 0.04      # 物块上方的预抓取距离，m
+    lift_distance: 0.06          # 抓取后的最小抬升距离，m
+    transport_height: 0.08       # 当前地面小物块场景的 TCP 高度；桌面场景需重新配置，m
+    release_clearance: 0.002     # 放置时让物块底面略高于目标支撑面，m
+    retreat_distance: 0.04       # 松开后向上撤离距离，m
+
+    # 当前 Piper 两个手指：joint7=q，joint8=-q，开口宽度约为 2*q。
+    gripper_open_width: 0.07
+    gripper_compression: 0.002   # 总开口比物块小 2 mm，每侧 1 mm 的目标余量形成夹持力
+    gripper_joint_signs: [1.0, -1.0]  # 顺序必须对应 gripper 组的变量顺序
+
+    max_target_age: 5.0          # 有时间戳的观测允许年龄，s；零时间戳用于手动目标
+    tf_timeout: 0.3              # 坐标转换等待上限，s

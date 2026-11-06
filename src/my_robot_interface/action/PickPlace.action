@@ -1,0 +1,27 @@
+# Goal：完成一个物块的抓取和放置。
+# object_id 对应规划场景中的物体名称，不使用颜色作为唯一编号。
+string object_id
+
+# 物体几何中心位姿；header 包含观测时间和坐标系，方向为有效单位四元数。
+# object_points 是表面点；新 objects 话题已输出中心位姿，不需重复换算。
+geometry_msgs/PoseStamped object_pose
+
+# 物体自身坐标系下的盒子尺寸 x/y/z，单位 m，均须大于零。
+geometry_msgs/Vector3 object_dimensions
+
+# 放置后的物体几何中心位姿，不是夹爪 TCP 位姿。
+# 固定放置坐标可用零时间戳，坐标系仍需明确指定。
+geometry_msgs/PoseStamped place_pose
+---
+# Result：执行结果；最终是否进入颜色分拣区域由任务节点另行视觉验证。
+bool success
+string message
+---
+# Feedback：只报告主要阶段，完成或失败通过 Result 返回。
+uint8 PREPARING=0     # 检查目标、准备规划场景
+uint8 PICKING=1       # 张开、接近、下降、夹紧
+uint8 TRANSFERRING=2  # 抬升、搬运
+uint8 PLACING=3       # 下降、松开、撤离
+
+uint8 stage
+string message

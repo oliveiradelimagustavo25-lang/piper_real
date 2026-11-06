@@ -1,0 +1,21 @@
+task_planner:
+  ros__parameters:
+    objects_topic: /perception/objects
+    action_name: /sorting/sort_objects
+    pick_place_action: /manipulation/pick_place
+    move_to_named_action: /manipulation/move_to_named
+    observation_target: pose_1      # SRDF arm 命名姿态；固定外部相机可设为 ""
+    observation_settle_time: 0.3    # s，到位后等待新图像；每个物块抓取前返回观察位
+    reference_frame: base_link
+    end_effector_frame: link6
+    tool_to_tcp: [0.0, 0.0, 0.132]   # 与 manipulation.yaml 的 TCP 标定一致
+
+    default_strategy: color_order
+    default_color_order: [1, 2, 3]   # 红、绿、蓝
+    max_observation_age: 2.0         # s，拒绝过期观测
+    observation_timeout: 5.0         # s，等待目标/TF/执行服务的最长时间
+
+    # 物体中心的放置位置，使用 reference_frame，m；当前为 1 cm 地面物块。
+    red.place_position: [0.26, -0.06, 0.005]
+    green.place_position: [0.26, 0.0, 0.005]
+    blue.place_position: [0.26, 0.06, 0.005]
