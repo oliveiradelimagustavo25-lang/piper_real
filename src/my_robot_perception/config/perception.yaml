@@ -1,12 +1,18 @@
 color_detector:
   ros__parameters:
-    image_topic: /camera_sensor/image_raw
+    image_topic: /camera/color/origin
+    # 深度只用于同帧标注，缺失时保留二维识别并显示 -- mm。
+    depth_points_topic: /perception/object_points
+    display_timeout: 0.15
+    input_timeout: 1.0         # RGB 断流后清除旧深度标注，显示 STALE
     labels_topic: /perception/color_labels
     debug_topic: /perception/color_debug
     show_window: false
     publish_debug: true
 
-    # 面积单位为像素；1 cm 小物块先使用较低阈值。
+    # 面积为参考分辨率下的像素数；原始 RGB 按面积比例自动换算。
+    # [0, 0] 表示直接使用当前图像的像素面积。
+    area_reference_size: [640, 480]
     min_area: 12
     max_area: 100000
     morphology_kernel: 3        # 奇数；1 表示不做形态学处理
@@ -17,15 +23,18 @@ color_detector:
     red.upper: [10, 255, 255]
     green.lower: [35, 80, 50]
     green.upper: [85, 255, 255]
-    blue.lower: [90, 80, 50]
+    # 原始 RGB 中蓝色杯盖实测 S 约84；保持原 S 下限80，避免漏掉正面。
+    blue.lower: [90, 80, 70]
     blue.upper: [135, 255, 255]
 
 depth_localizer:
   ros__parameters:
     labels_topic: /perception/color_labels
-    # 实机需替换为对齐到彩色图的深度话题，并使用对应彩色内参。
-    depth_topic: /camera_sensor/depth/image_raw
-    camera_info_topic: /camera_sensor/camera_info
+    # 原始 RGB 标签与 ToF 不同网格，由本节点通过几何投影关联。
+    depth_topic: /camera/depth
+    camera_info_topic: /camera/info/depth
+    color_info_topic: /camera/info/color
+    extrinsics_topic: /camera/extrinsics/color_to_depth
     points_topic: /perception/object_points
     target_frame: ""             # 空字符串：相机光学系；可改为 base_link
     objects_topic: /perception/objects
@@ -34,14 +43,33 @@ depth_localizer:
     top_surface_tolerance: 0.002 # 上部点的高度容差，m；要求物块平放且顶部可见
     tf_timeout: 0.1              # s，等待采集时刻的 TF 到达，避免图像略早于关节 TF
     sync_slop: 0.03               # RGB 标签与深度时间差上限，单位 s
+    input_timeout: 1.0            # 无匹配输入时发布空观测，禁止沿用旧坐标
+    surface_separation: 0.005      # 前景边界判定的平面距离下限，另加测得的表面噪声，m
     min_depth: 0.05               # 单位 m
     max_depth: 3.0
-    depth_tolerance: 0.02         # 保留距区域深度中值不超过此值的像素
+    depth_tolerance: 0.02         # 按相邻 Z 差分层；选通过前景边界检查且支持点最多的一层，m
     min_valid_pixels: 5
     erosion_kernel: 1            # 奇数；3 可去除边缘，1 适合当前小物块
 
 aruco_detector:
   ros__parameters:
-    marker_size: 0.1666666667    # 黑色标记边长，单位 m，不含白边
+    image_topic: /camera/color/origin
+    camera_info_topic: /camera/info/color
+    dictionary: DICT_4X4_50     # 必须与实物标记的生成字典一致
+    marker_size: 0.03          # 单个黑色标记边长 30 mm，含黑框，不含白边
     show_window: false
     binary_threshold: 160
+
+vidu_ros2_wrapper_node:
+  ros__parameters:
+    color_frame_id: camera_color_optical_frame
+    depth_frame_id: camera_depth_optical_frame
+    # 空值读取 SDK；file:///绝对路径 或 package://包名/路径。
+    # 深度文件 K/D 必须与 SDK 一致，覆盖消息不能重标定 SDK 的 XYZ。
+    color_camera_info_url: ""
+    depth_camera_info_url: ""
+    # 本机 SDK 2.1 实测缓冲区为 BGR，PFNC 却标 RGB8；auto 则按 PFNC。
+    sdk_color_order: bgr
+    retry_interval: 2.0         # SDK/标定/模式失败后重试间隔，使用墙上时间，s
+    startup_timeout: 10.0       # PCL 配置完成后的首帧等待上限，s
+    frame_timeout: 5.0          # 已收到首帧后的连续无帧上限，s

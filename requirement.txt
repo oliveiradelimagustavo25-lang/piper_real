@@ -1,0 +1,14 @@
+# Python direct dependencies recorded from the working Ubuntu 22.04 / Python 3.10
+# environment on 2026-11-07. This is not a full environment lock file.
+# Install ROS/system dependencies with rosdep/APT first; see README.md.
+numpy==1.21.5
+scipy==1.8.0
+python-can==4.6.1
+
+# Development: offline visual-pipeline regression tests.
+pytest==6.2.5
+
+# cv2 / cv_bridge / rclpy / launch / ament_index_python come from APT/ROS.
+# Do not install a second OpenCV Python distribution through this file.
+# pyAgxArm 1.0.0 is installed from external local SDK source; see README.md.
+# Vidu SDK 2.1 is a separate native SDK, not a pip package.
