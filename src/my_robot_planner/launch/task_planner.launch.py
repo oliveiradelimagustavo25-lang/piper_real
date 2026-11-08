@@ -11,7 +11,7 @@ def generate_launch_description():
         get_package_share_directory('my_robot_planner'), 'config', 'task_planner.yaml')
     return LaunchDescription([
         DeclareLaunchArgument('config', default_value=config),
-        DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
         Node(package='my_robot_planner', executable='task_planner', output='screen',
              parameters=[LaunchConfiguration('config'),
                          {'use_sim_time': LaunchConfiguration('use_sim_time')}]),

@@ -50,8 +50,9 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
-  ament_add_pytest_test(visual_pipeline test/test_visual_pipeline.py TIMEOUT 90
-    ENV ROS_DOMAIN_ID=173 ROS_LOCALHOST_ONLY=1)
+  ament_add_pytest_test(visual_pipeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../test/test_visual_pipeline.py TIMEOUT 90
+    ENV ROS_DOMAIN_ID=173 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/ros_logs)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

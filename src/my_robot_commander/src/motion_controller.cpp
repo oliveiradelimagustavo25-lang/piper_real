@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 
@@ -44,8 +45,12 @@ struct MotionController::Impl
     {
       throw std::invalid_argument("Invalid motion scaling, planning time or Cartesian step");
     }
-    arm = std::make_unique<Group>(node, options.arm_group);
-    gripper = std::make_unique<Group>(node, options.gripper_group);
+    arm = std::make_unique<Group>(
+      node, Group::Options(
+        options.arm_group, "robot_description", node->get_namespace()));
+    gripper = std::make_unique<Group>(
+      node, Group::Options(
+        options.gripper_group, "robot_description", node->get_namespace()));
     for (auto * group : {arm.get(), gripper.get()}) {
       group->setMaxVelocityScalingFactor(options.velocity_scaling);
       group->setMaxAccelerationScalingFactor(options.acceleration_scaling);
@@ -106,7 +111,7 @@ bool MotionController::moveToJoints(const std::vector<double> & joints)
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto & arm = *impl_->arm;
   if (joints.size() != arm.getVariableCount() ||
-    !std::all_of(joints.begin(), joints.end(), [](double v) { return std::isfinite(v); }))
+    !std::all_of(joints.begin(), joints.end(), [](double v) {return std::isfinite(v);}))
   {
     RCLCPP_ERROR(impl_->node->get_logger(), "Invalid joint count or non-finite joint value");
     return false;
@@ -163,7 +168,8 @@ bool MotionController::moveToPose(const geometry_msgs::msg::PoseStamped & pose, 
   } else {
     // Cartesian API 的 waypoints 不含 Header，必须明确在统一参考系下输入。
     if (target.header.frame_id != impl_->options.reference_frame) {
-      RCLCPP_ERROR(impl_->node->get_logger(), "Cartesian target must be in %s",
+      RCLCPP_ERROR(
+        impl_->node->get_logger(), "Cartesian target must be in %s",
         impl_->options.reference_frame.c_str());
       return false;
     }
@@ -200,7 +206,7 @@ bool MotionController::moveGripperToJoints(const std::vector<double> & joints)
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto & gripper = *impl_->gripper;
   if (joints.size() != gripper.getVariableCount() ||
-    !std::all_of(joints.begin(), joints.end(), [](double v) { return std::isfinite(v); }))
+    !std::all_of(joints.begin(), joints.end(), [](double v) {return std::isfinite(v);}))
   {
     RCLCPP_ERROR(impl_->node->get_logger(), "Invalid gripper joint target");
     return false;
@@ -216,6 +222,31 @@ bool MotionController::moveGripperToJoints(const std::vector<double> & joints)
 bool MotionController::closeGripper()
 {
   return moveGripperToNamedTarget(impl_->options.gripper_close_target);
+}
+
+bool MotionController::moveGripperToWidth(double width)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  auto & gripper = *impl_->gripper;
+  const auto * model = gripper.getRobotModel()->getJointModelGroup(impl_->options.gripper_group);
+  const auto & joints = model->getActiveJointModelNames();
+  if (!std::isfinite(width) || width < 0 || joints.size() != 1 ||
+    joints.front() != impl_->options.gripper_width_joint ||
+    gripper.getRobotModel()->getJointModel(joints.front())->getType() !=
+    moveit::core::JointModel::PRISMATIC)
+  {
+    RCLCPP_ERROR(impl_->node->get_logger(), "Width control requires one prismatic gripper joint");
+    return false;
+  }
+  gripper.setStartStateToCurrentState();
+  // Set the independent joint by name; MoveIt updates its mimic fingers.
+  if (!gripper.setJointValueTarget(
+      std::map<std::string, double>{{impl_->options.gripper_width_joint, width}}))
+  {
+    RCLCPP_ERROR(impl_->node->get_logger(), "Gripper width is outside configured bounds");
+    return false;
+  }
+  return impl_->planAndExecute(gripper);
 }
 
 }  // namespace my_robot_commander

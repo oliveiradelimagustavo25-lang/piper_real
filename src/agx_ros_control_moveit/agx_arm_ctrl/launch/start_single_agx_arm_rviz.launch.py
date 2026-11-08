@@ -97,18 +97,6 @@ def generate_launch_description():
         description='Follow real arm state.',
     )
 
-    feedback_topic_arg = DeclareLaunchArgument(
-        'feedback_topic',
-        default_value='feedback/joint_states',
-        description='Feedback joint states topic for display.launch (follow:=true).',
-    )
-
-    control_topic_arg = DeclareLaunchArgument(
-        'control_topic',
-        default_value='control/joint_states',
-        description='Control joint states topic for display.launch (follow:=false / joint_state_publisher).',
-    )
-
     control_arg = DeclareLaunchArgument(
         'control',
         default_value='false',
@@ -152,8 +140,8 @@ def generate_launch_description():
             'follow': LaunchConfiguration('follow'),
             'tcp_offset': LaunchConfiguration('tcp_offset'),
             'control': LaunchConfiguration('control'),
-            'feedback_topic': LaunchConfiguration('feedback_topic'),
-            'control_topic': LaunchConfiguration('control_topic'),
+            'feedback_topic': 'feedback/joint_states',
+            'control_topic': 'control/joint_states',
         }.items(),
     )
 
@@ -200,8 +188,6 @@ def generate_launch_description():
         tcp_offset_arg,
         gripper_default_effort_arg,
         follow_arg,
-        feedback_topic_arg,
-        control_topic_arg,
         control_arg,
         # agx_arm
         agx_arm_launch,

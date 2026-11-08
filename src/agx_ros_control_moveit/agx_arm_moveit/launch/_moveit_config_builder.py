@@ -39,18 +39,8 @@ def declare_common_args():
             default_value="false",
             choices=["true", "false"],
             description="Follow real arm state. "
-            "true: move_group subscribes to feedback_topic; "
-            "false: subscribes to control_topic (mock hardware).",
-        ),
-        DeclareLaunchArgument(
-            "feedback_topic",
-            default_value="feedback/joint_states",
-            description="Joint states feedback topic (used when follow:=true).",
-        ),
-        DeclareLaunchArgument(
-            "control_topic",
-            default_value="control/joint_states",
-            description="Joint states control topic (used when follow:=false, and for ros2_control_node).",
+            "true: subscribes to feedback/joint_states; "
+            "false: subscribes to control/joint_states (mock hardware).",
         ),
     ]
 
@@ -61,6 +51,11 @@ def _select_profile(effector_type: str, revo2_type: str) -> str:
     if effector_type in ("revo2", "revo2_pro", "revo2_touch"):
         return f"revo2_{revo2_type}"
     return "none"
+
+
+def joint_state_topic(context):
+    follow = LaunchConfiguration("follow").perform(context) == "true"
+    return "feedback/joint_states" if follow else "control/joint_states"
 
 
 def build_moveit_config(context):
@@ -98,7 +93,6 @@ def build_moveit_config(context):
         )
         .robot_description_kinematics(file_path="config/kinematics.yaml")
         .joint_limits(file_path="config/joint_limits.yaml")
-        .sensors_3d(file_path="config/sensors_3d.yaml")
         .trajectory_execution(file_path=f"config/moveit_controllers_{profile}.yaml")
         .to_moveit_configs()
     )
@@ -110,5 +104,9 @@ def build_moveit_config(context):
             "joint1", "joint2", "joint3", "joint4",
             "joint5", "joint6", "joint7",
         ]
+
+    # Camera obstacle integration belongs to the perception/scene layer.
+    # Remove the sensor configuration automatically loaded by MoveItConfigsBuilder.
+    moveit_config.sensors_3d = {}
 
     return moveit_config

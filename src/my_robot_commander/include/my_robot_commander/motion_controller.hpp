@@ -12,8 +12,12 @@
 namespace my_robot_commander
 {
 
-// 同步运动接口；调用期间需有 executor 处理传入节点的 ROS 回调。
-// 同一实例的运动按顺序执行；true 表示轨迹执行成功，不代表已确认夹住物体。
+// 底层对上的同步 C++ 接口；无任务、视觉或碰撞场景管理逻辑。
+// 调用期间需有 executor 处理传入节点的 ROS 回调，同一实例的运动串行执行。
+// 长度为 m、角度为 rad；关节向量沿 MoveIt 组的变量顺序。
+// true 仅表示 MoveIt 执行成功，不证明真机到位或夹住物体；输入/规划/执行被拒返回 false。
+// 配置或 ROS/MoveIt 异常可向调用者抛出；不提供运动中取消。
+// 当前执行器 Action 的取消在基本动作完成后生效。
 class MotionController
 {
 public:
@@ -23,8 +27,9 @@ public:
     std::string gripper_group = "gripper";
     std::string reference_frame = "base_link";
     std::string end_effector_link;  // 空值沿用 MoveIt 配置。
-    std::string gripper_open_target = "open";
-    std::string gripper_close_target = "close";
+    std::string gripper_open_target = "gripper_open";
+    std::string gripper_close_target = "gripper_close";
+    std::string gripper_width_joint = "gripper";  // Independent joint, total opening in metres.
     double velocity_scaling = 0.2;
     double acceleration_scaling = 0.2;
     double planning_time = 5.0;
@@ -38,7 +43,7 @@ public:
   MotionController(const MotionController &) = delete;
   MotionController & operator=(const MotionController &) = delete;
 
-  bool moveToNamedTarget(const std::string & name);
+  bool moveToNamedTarget(const std::string & name);  // 仅 arm 组。
   bool moveToJoints(const std::vector<double> & joints);
   bool moveToPose(const geometry_msgs::msg::PoseStamped & pose, bool cartesian = false);
   bool moveToPose(
@@ -46,6 +51,7 @@ public:
     bool cartesian = false);
   bool moveGripperToNamedTarget(const std::string & name);
   bool moveGripperToJoints(const std::vector<double> & joints);
+  bool moveGripperToWidth(double width);  // 绝对总开口，0.04 表示 40 mm。
   bool openGripper();
   bool closeGripper();
 

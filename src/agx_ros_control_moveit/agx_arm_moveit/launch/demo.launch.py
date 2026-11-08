@@ -19,10 +19,8 @@ from launch_ros.actions import Node, PushRosNamespace, SetRemap
 from moveit_configs_utils.launch_utils import DeclareBooleanLaunchArg
 
 from _moveit_config_builder import (
-    ALL_ARM_TYPES,
-    ALL_EFFECTOR_TYPES,
-    ALL_REVO2_TYPES,
     build_moveit_config,
+    declare_common_args,
 )
 
 
@@ -51,6 +49,7 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
         (f"/{ns}/arm_controller" if ns else "/arm_controller"): {
             "ros__parameters": {
                 "joints": arm_joints,
+                "allow_nonzero_velocity_at_trajectory_end": False,
                 "command_interfaces": ["position"],
                 "state_interfaces": ["position", "velocity"],
             },
@@ -65,6 +64,7 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
         config[(f"/{ns}/gripper_controller" if ns else "/gripper_controller")] = {
             "ros__parameters": {
                 "joints": ["gripper"],
+                "allow_nonzero_velocity_at_trajectory_end": False,
                 "command_interfaces": ["position"],
                 "state_interfaces": ["position", "velocity"],
             },
@@ -78,6 +78,7 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
         config[cm_node]["ros__parameters"].update(cm_controllers)
         config[(f"/{ns}/{ctrl_name}" if ns else f"/{ctrl_name}")] = {
             "ros__parameters": {
+                "allow_nonzero_velocity_at_trajectory_end": False,
                 "joints": [
                     f"{side}_thumb_metacarpal_joint",
                     f"{side}_thumb_proximal_joint",
@@ -153,6 +154,11 @@ def _build_moveit(context):
             )
         )
     )
+    status_topics = ["arm_controller/follow_joint_trajectory/_action/status"]
+    if effector_type == "agx_gripper":
+        status_topics.append("gripper_controller/follow_joint_trajectory/_action/status")
+    elif effector_type in ("revo2", "revo2_pro", "revo2_touch"):
+        status_topics.append(f"{revo2_type}_hand_controller/follow_joint_trajectory/_action/status")
     actions.append(
         Node(
             package="agx_arm_moveit",
@@ -160,9 +166,7 @@ def _build_moveit(context):
             output="screen",
             parameters=[
                 {
-                    "status_topics": [
-                        "arm_controller/follow_joint_trajectory/_action/status",
-                    ],
+                    "status_topics": status_topics,
                     "gate_service_name": LaunchConfiguration("control_gate_service"),
                 }
             ],
@@ -202,7 +206,7 @@ def _build_moveit(context):
                 moveit_config.robot_description,
                 ros2_controllers_yaml,
             ],
-            remappings=[("joint_states", LaunchConfiguration("control_topic"))],
+            remappings=[("joint_states", "control/joint_states")],
         )
     )
 
@@ -227,43 +231,7 @@ def _build_moveit(context):
 
 def generate_launch_description():
     return LaunchDescription(
-        [
-            DeclareLaunchArgument(
-                "namespace",
-                default_value="",
-                description="ROS namespace for this arm instance (e.g. arm1).",
-            ),
-            DeclareLaunchArgument(
-                "arm_type",
-                default_value="piper",
-                choices=ALL_ARM_TYPES,
-                description="Arm type.",
-            ),
-            DeclareLaunchArgument(
-                "effector_type",
-                default_value="none",
-                choices=ALL_EFFECTOR_TYPES,
-                description="Effector type.",
-            ),
-            DeclareLaunchArgument(
-                "revo2_type",
-                default_value="left",
-                choices=ALL_REVO2_TYPES,
-                description="Revo2 / Revo2 Pro / Revo2 Touch hand side.",
-            ),
-            DeclareLaunchArgument(
-                "tcp_offset",
-                default_value="[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]",
-                description="TCP offset [x, y, z, rx, ry, rz] in meters/radians.",
-            ),
-            DeclareLaunchArgument(
-                "follow",
-                default_value="false",
-                choices=["true", "false"],
-                description="Follow real arm state. "
-                "true: move_group subscribes to feedback_topic; "
-                "false: subscribes to control_topic (mock hardware).",
-            ),
+        declare_common_args() + [
             DeclareBooleanLaunchArg(
                 "db",
                 default_value=False,

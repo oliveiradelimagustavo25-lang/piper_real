@@ -7,7 +7,7 @@ pick_place_executor:
     gripper_group: gripper
     end_effector_link: link6
     objects_topic: /perception/objects
-    touch_links: [link7, link8]
+    touch_links: [gripper_link1, gripper_link2]
 
     # 与 preview.xml 地面和 objects/aruco_board.xml 的尺寸、位姿保持一致。
     scene_boxes: [ground, aruco_board]
@@ -35,10 +35,10 @@ pick_place_executor:
     release_clearance: 0.002     # 放置时让物块底面略高于目标支撑面，m
     retreat_distance: 0.04       # 松开后向上撤离距离，m
 
-    # 当前 Piper 两个手指：joint7=q，joint8=-q，开口宽度约为 2*q。
+    # AGX 独立 gripper 关节表示总开口宽度；手指由模型 mimic 派生。
+    gripper_width_joint: gripper
     gripper_open_width: 0.07
     gripper_compression: 0.002   # 总开口比物块小 2 mm，每侧 1 mm 的目标余量形成夹持力
-    gripper_joint_signs: [1.0, -1.0]  # 顺序必须对应 gripper 组的变量顺序
 
     max_target_age: 5.0          # 有时间戳的观测允许年龄，s；零时间戳用于手动目标
     tf_timeout: 0.3              # 坐标转换等待上限，s

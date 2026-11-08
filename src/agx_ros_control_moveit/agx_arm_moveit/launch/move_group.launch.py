@@ -12,15 +12,12 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from moveit_configs_utils.launch_utils import DeclareBooleanLaunchArg
 
-from _moveit_config_builder import build_moveit_config, declare_common_args
+from _moveit_config_builder import build_moveit_config, declare_common_args, joint_state_topic
 
 
 def _launch(context):
     moveit_config = build_moveit_config(context)
-    follow = LaunchConfiguration("follow").perform(context) == "true"
-    feedback_topic = LaunchConfiguration("feedback_topic").perform(context)
-    control_topic = LaunchConfiguration("control_topic").perform(context)
-    joint_states_topic = str(feedback_topic) if follow else str(control_topic)
+    joint_states_topic = joint_state_topic(context)
 
     move_group_configuration = {
         "publish_robot_description_semantic": True,

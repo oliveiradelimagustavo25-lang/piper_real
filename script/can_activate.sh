@@ -8,6 +8,14 @@ DEFAULT_BITRATE="${2:-1000000}"
 
 # USB hardware address (optional parameter)
 USB_ADDRESS="${3}"
+
+run_ip() {
+    if ! sudo ip "$@"; then
+        echo "Error: CAN configuration failed: ip $*." >&2
+        exit 1
+    fi
+}
+
 echo "-------------------START-----------------------"
 # Check if ethtool is installed.
 if ! dpkg -l | grep -q "ethtool"; then
@@ -93,21 +101,21 @@ else
 fi
 
 # Check if the current interface is already activated.
-IS_LINK_UP=$(ip link show "$INTERFACE_NAME" | grep -q "UP" && echo "yes" || echo "no")
+IS_LINK_UP=$(ip link show "$INTERFACE_NAME" | grep -qE '<([^>]*,)?UP(,|>)' && echo "yes" || echo "no")
 
 # Retrieve the bitrate of the current interface.
 CURRENT_BITRATE=$(ip -details link show "$INTERFACE_NAME" | grep -oP 'bitrate \K\d+')
 
-if [ "$IS_LINK_UP" = "yes" ] && [ "$CURRENT_BITRATE" -eq "$DEFAULT_BITRATE" ]; then
-    echo "Interface $INTERFACE_NAME is already activated with a bitrate of $DEFAULT_BITRATE."
+if [ "$IS_LINK_UP" = "yes" ] && [ "$CURRENT_BITRATE" = "$DEFAULT_BITRATE" ]; then
+    echo "Interface $INTERFACE_NAME has the requested configuration; checking final state."
     
     # Check if the interface name matches the default name.
     if [ "$INTERFACE_NAME" != "$DEFAULT_CAN_NAME" ]; then
         echo "Rename interface $INTERFACE_NAME to $DEFAULT_CAN_NAME."
-        sudo ip link set "$INTERFACE_NAME" down
-        sudo ip link set "$INTERFACE_NAME" name "$DEFAULT_CAN_NAME"
-        sudo ip link set "$DEFAULT_CAN_NAME" up
-        echo "The interface has been renamed to $DEFAULT_CAN_NAME and reactivated."
+        run_ip link set "$INTERFACE_NAME" down
+        run_ip link set "$INTERFACE_NAME" name "$DEFAULT_CAN_NAME"
+        run_ip link set "$DEFAULT_CAN_NAME" up
+        echo "Renamed interface to $DEFAULT_CAN_NAME; checking final state."
     else
         echo "The interface name is already $DEFAULT_CAN_NAME."
     fi
@@ -120,19 +128,28 @@ else
     fi
     
     # Set the interface bitrate and activate it.
-    sudo ip link set "$INTERFACE_NAME" down
-    sudo ip link set "$INTERFACE_NAME" type can bitrate $DEFAULT_BITRATE
-    sudo ip link set "$INTERFACE_NAME" up
-    echo "Interface $INTERFACE_NAME has been reset to bitrate $DEFAULT_BITRATE and activated."
+    run_ip link set "$INTERFACE_NAME" down
+    run_ip link set "$INTERFACE_NAME" type can bitrate "$DEFAULT_BITRATE"
+    run_ip link set "$INTERFACE_NAME" up
     
     # Rename the interface to the default name.
     if [ "$INTERFACE_NAME" != "$DEFAULT_CAN_NAME" ]; then
         echo "Rename interface $INTERFACE_NAME to $DEFAULT_CAN_NAME."
-        sudo ip link set "$INTERFACE_NAME" down
-        sudo ip link set "$INTERFACE_NAME" name "$DEFAULT_CAN_NAME"
-        sudo ip link set "$DEFAULT_CAN_NAME" up
-        echo "The interface has been renamed to $DEFAULT_CAN_NAME and reactivated."
+        run_ip link set "$INTERFACE_NAME" down
+        run_ip link set "$INTERFACE_NAME" name "$DEFAULT_CAN_NAME"
+        run_ip link set "$DEFAULT_CAN_NAME" up
     fi
 fi
 
+DETAILS=$(ip -details link show "$DEFAULT_CAN_NAME") || {
+    echo "Error: cannot read the final CAN interface state." >&2
+    exit 1
+}
+FINAL_BITRATE=$(printf '%s\n' "$DETAILS" | grep -oP 'bitrate \K\d+' | head -n 1)
+if ! printf '%s\n' "$DETAILS" | grep -qE '<([^>]*,)?UP(,|>)' ||
+   [ "$FINAL_BITRATE" != "$DEFAULT_BITRATE" ]; then
+    echo "Error: $DEFAULT_CAN_NAME is not UP with bitrate $DEFAULT_BITRATE." >&2
+    exit 1
+fi
+echo "Interface $DEFAULT_CAN_NAME is activated with bitrate $FINAL_BITRATE."
 echo "-------------------OVER------------------------"

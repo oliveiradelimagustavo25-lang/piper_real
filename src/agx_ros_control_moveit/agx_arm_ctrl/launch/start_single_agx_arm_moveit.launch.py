@@ -107,18 +107,10 @@ def generate_launch_description():
         description='Follow real arm state.',
     )
 
-    feedback_topic_arg = DeclareLaunchArgument(
-        'feedback_topic',
-        default_value='feedback/joint_states',
-        description='Joint states feedback topic for MoveIt (follow:=true).',
+    use_rviz_arg = DeclareLaunchArgument(
+        'use_rviz', default_value='true', choices=['true', 'false'],
+        description='Start the MoveIt RViz window.',
     )
-
-    control_topic_arg = DeclareLaunchArgument(
-        'control_topic',
-        default_value='control/joint_states',
-        description='Joint states control topic for MoveIt (follow:=false, ros2_control remap).',
-    )
-
     auto_control_gate_arg = DeclareLaunchArgument(
         'auto_control_gate',
         default_value='false',
@@ -186,8 +178,7 @@ def generate_launch_description():
             'revo2_type': LaunchConfiguration('revo2_type'),
             'tcp_offset': LaunchConfiguration('tcp_offset'),
             'follow': LaunchConfiguration('follow'),
-            'feedback_topic': LaunchConfiguration('feedback_topic'),
-            'control_topic': LaunchConfiguration('control_topic'),
+            'use_rviz': LaunchConfiguration('use_rviz'),
             'auto_control_gate': LaunchConfiguration('auto_control_gate'),
             'control_gate_service': LaunchConfiguration('control_gate_service'),
         }.items(),
@@ -210,8 +201,7 @@ def generate_launch_description():
         tcp_offset_arg,
         gripper_default_effort_arg,
         follow_arg,
-        feedback_topic_arg,
-        control_topic_arg,
+        use_rviz_arg,
         auto_control_gate_arg,
         control_gate_service_arg,
         # launches

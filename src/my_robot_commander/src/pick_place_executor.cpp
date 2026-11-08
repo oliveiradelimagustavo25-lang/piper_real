@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -58,7 +59,8 @@ geometry_msgs::msg::PoseStamped toolPose(
 }
 
 // 盒子在夹爪局部 Y（闭合方向）上的投影宽度。
-double graspWidth(const geometry_msgs::msg::Pose & object,
+double graspWidth(
+  const geometry_msgs::msg::Pose & object,
   const geometry_msgs::msg::Vector3 & dimensions, const tf2::Quaternion & tool_rotation)
 {
   tf2::Quaternion object_rotation;
@@ -87,15 +89,20 @@ public:
     Motion::Options options;
     options.arm_group = parameter(node_, "arm_group", options.arm_group);
     options.gripper_group = parameter(node_, "gripper_group", options.gripper_group);
+    options.gripper_width_joint = parameter(
+      node_, "gripper_width_joint", options.gripper_width_joint);
     frame_ = options.reference_frame = parameter(node_, "reference_frame", options.reference_frame);
     options.end_effector_link = parameter<std::string>(node_, "end_effector_link", "link6");
     options.velocity_scaling = parameter(node_, "velocity_scaling", options.velocity_scaling);
-    options.acceleration_scaling = parameter(node_, "acceleration_scaling", options.acceleration_scaling);
+    options.acceleration_scaling = parameter(
+      node_, "acceleration_scaling",
+      options.acceleration_scaling);
     options.planning_time = parameter(node_, "planning_time", options.planning_time);
     options.cartesian_step = parameter(node_, "cartesian_step", options.cartesian_step);
     tool_to_tcp_ = vector3(parameter<std::vector<double>>(node_, "tool_to_tcp", {0, 0, 0.132}));
     offset_ = vector3(parameter<std::vector<double>>(node_, "grasp_offset", {0, 0, 0}));
-    const auto rpy = vector3(parameter<std::vector<double>>(
+    const auto rpy = vector3(
+      parameter<std::vector<double>>(
         node_, "grasp_rpy", {0, 3.141592653589793, 0}));
     tool_rotation_.setRPY(rpy.x(), rpy.y(), rpy.z());
     approach_ = parameter(node_, "approach_distance", 0.04);
@@ -105,13 +112,24 @@ public:
     retreat_ = parameter(node_, "retreat_distance", 0.04);
     open_width_ = parameter(node_, "gripper_open_width", 0.07);
     compression_ = parameter(node_, "gripper_compression", 0.002);
-    signs_ = parameter<std::vector<double>>(node_, "gripper_joint_signs", {1.0, -1.0});
     max_age_ = parameter(node_, "max_target_age", 5.0);
     tf_timeout_ = parameter(node_, "tf_timeout", 0.3);
-    if (signs_.size() != 2 || open_width_ <= 0 || compression_ < 0 ||
+    if (open_width_ <= 0 || compression_ < 0 ||
       approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0)
     {
       throw std::invalid_argument("Invalid gripper configuration or approach/lift/retreat distances");
+    }
+    // Wait for the dependency when the independent layers start concurrently.
+    // Robot descriptions are received from the control stack's latched topics.
+    auto planning_scene = node_->create_client<moveit_msgs::srv::GetPlanningScene>(
+      "get_planning_scene");
+    while (!planning_scene->wait_for_service(std::chrono::seconds(1))) {
+      if (!rclcpp::ok()) {
+        throw std::runtime_error("Shutdown while waiting for MoveIt");
+      }
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Waiting for control stack: get_planning_scene");
     }
     motion_ = std::make_unique<Motion>(node_, options);
     scene_ = std::make_unique<Scene>(node_, tf_buffer_, frame_, options.end_effector_link);
@@ -123,7 +141,8 @@ public:
       });
 
     const auto name = parameter<std::string>(node_, "action_name", "/manipulation/pick_place");
-    server_ = rclcpp_action::create_server<Action>(node_, name,
+    server_ = rclcpp_action::create_server<Action>(
+      node_, name,
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const Action::Goal> goal) {
         if (!validGoal(*goal) || holding_ || busy_.exchange(true)) {
           RCLCPP_WARN(node_->get_logger(), "Rejected invalid/busy goal or object still held");
@@ -139,10 +158,11 @@ public:
         if (worker_.joinable()) {
           worker_.join();
         }
-        worker_ = std::thread([this, handle]() { execute(handle); });
+        worker_ = std::thread([this, handle]() {execute(handle);});
       });
     RCLCPP_INFO(node_->get_logger(), "PickPlace executor ready: %s", name.c_str());
-    named_server_ = rclcpp_action::create_server<NamedAction>(node_,
+    named_server_ = rclcpp_action::create_server<NamedAction>(
+      node_,
       parameter<std::string>(node_, "move_to_named_action", "/manipulation/move_to_named"),
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const NamedAction::Goal> goal) {
         if (goal->target.empty() || busy_.exchange(true)) {
@@ -150,10 +170,10 @@ public:
         }
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
       },
-      [](std::shared_ptr<NamedHandle>) { return rclcpp_action::CancelResponse::ACCEPT; },
+      [](std::shared_ptr<NamedHandle>) {return rclcpp_action::CancelResponse::ACCEPT;},
       [this](std::shared_ptr<NamedHandle> handle) {
-        if (worker_.joinable()) { worker_.join(); }
-        worker_ = std::thread([this, handle]() { executeNamed(handle); });
+        if (worker_.joinable()) {worker_.join();}
+        worker_ = std::thread([this, handle]() {executeNamed(handle);});
       });
 
     // If an action stops with a carried object, release it explicitly after recovery.
@@ -167,9 +187,9 @@ public:
           return;
         }
         try {
-          std::vector<double> joints;
-          for (const auto sign : signs_) {joints.push_back(sign * open_width_ / 2.0);}
-          if (!motion_->moveGripperToJoints(joints)) {throw std::runtime_error("Opening gripper failed");}
+          if (!motion_->moveGripperToWidth(open_width_)) {
+            throw std::runtime_error("Opening gripper failed");
+          }
           if (scene_->holding()) {scene_->release();}
           holding_ = false;
           scene_->restoreTouch();
@@ -230,13 +250,13 @@ private:
   bool validGoal(const Action::Goal & goal) const
   {
     const auto pose_valid = [](const geometry_msgs::msg::PoseStamped & p) {
-      const auto & v = p.pose.position;
-      const auto & q = p.pose.orientation;
-      return !p.header.frame_id.empty() && std::isfinite(v.x) && std::isfinite(v.y) &&
-             std::isfinite(v.z) && std::isfinite(q.x) && std::isfinite(q.y) &&
-             std::isfinite(q.z) && std::isfinite(q.w) &&
-             std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w)) > 1e-9;
-    };
+        const auto & v = p.pose.position;
+        const auto & q = p.pose.orientation;
+        return !p.header.frame_id.empty() && std::isfinite(v.x) && std::isfinite(v.y) &&
+               std::isfinite(v.z) && std::isfinite(q.x) && std::isfinite(q.y) &&
+               std::isfinite(q.z) && std::isfinite(q.w) &&
+               std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w)) > 1e-9;
+      };
     const auto & d = goal.object_dimensions;
     return !goal.object_id.empty() && pose_valid(goal.object_pose) && pose_valid(goal.place_pose) &&
            std::isfinite(d.x) && d.x > 0 && std::isfinite(d.y) && d.y > 0 &&
@@ -264,35 +284,33 @@ private:
     auto result = std::make_shared<Action::Result>();
     auto feedback = std::make_shared<Action::Feedback>();
     const auto stage = [&](uint8_t value, const std::string & message) {
-      feedback->stage = value;
-      feedback->message = message;
-      if (rclcpp::ok()) {
-        handle->publish_feedback(feedback);
-      }
-    };
+        feedback->stage = value;
+        feedback->message = message;
+        if (rclcpp::ok()) {
+          handle->publish_feedback(feedback);
+        }
+      };
     const auto step = [&](const std::string & name, const std::function<bool()> & operation) {
-      if (interrupted(handle)) {
-        throw std::runtime_error("Canceled before " + name);
-      }
-      if (!operation()) {
-        throw std::runtime_error(name + " failed");
-      }
-    };
+        if (interrupted(handle)) {
+          throw std::runtime_error("Canceled before " + name);
+        }
+        if (!operation()) {
+          throw std::runtime_error(name + " failed");
+        }
+      };
     const auto move = [&](const tf2::Vector3 & tcp, bool cartesian) {
-      return motion_->moveToPose(toolPose(tcp, tool_rotation_, tool_to_tcp_, frame_), cartesian);
-    };
+        return motion_->moveToPose(toolPose(tcp, tool_rotation_, tool_to_tcp_, frame_), cartesian);
+      };
     const auto grip = [&](double width) {
-      std::vector<double> joints;
-      for (const auto sign : signs_) {
-        joints.push_back(sign * width / 2.0);
-      }
-      return motion_->moveGripperToJoints(joints);
-    };
+        return motion_->moveGripperToWidth(width);
+      };
 
     try {
       stage(Action::Feedback::PREPARING, "Preparing object and tool targets");
       const auto goal = handle->get_goal();
-      const auto stamp = rclcpp::Time(goal->object_pose.header.stamp, node_->get_clock()->get_clock_type());
+      const auto stamp = rclcpp::Time(
+        goal->object_pose.header.stamp,
+        node_->get_clock()->get_clock_type());
       if (stamp.nanoseconds() != 0 && max_age_ > 0) {
         const double age = (node_->now() - stamp).seconds();
         if (age < -0.1 || age > max_age_) {
@@ -305,9 +323,11 @@ private:
       if (width >= open_width_) {
         throw std::runtime_error("Object is wider than configured gripper opening");
       }
-      const tf2::Vector3 pick = tf2::Vector3(object.pose.position.x,
+      const tf2::Vector3 pick = tf2::Vector3(
+        object.pose.position.x,
         object.pose.position.y, object.pose.position.z) + offset_;
-      const tf2::Vector3 put = tf2::Vector3(place.pose.position.x,
+      const tf2::Vector3 put = tf2::Vector3(
+        place.pose.position.x,
         place.pose.position.y, place.pose.position.z + clearance_) + offset_;
       // 固定工具朝向下，搬运不会改变物块姿态。
       tf2::Quaternion object_q, place_q;
@@ -325,29 +345,31 @@ private:
       scene_->prepare(goal->object_id, object, goal->object_dimensions);
 
       stage(Action::Feedback::PICKING, "Opening, approaching and gripping " + goal->object_id);
-      step("Open gripper", [&]() { return grip(open_width_); });
-      step("Move to pre-grasp", [&]() { return move(pre_pick, false); });
-      step("Descend to grasp", [&]() { return move(pick, true); });
-      step("Close gripper", [&]() {
-        // The MoveIt attachment is a planning model, not proof of a physical grasp.
-        scene_->attach();
-        holding_ = true;
-        return grip(std::max(0.0, width - compression_));
-      });
+      step("Open gripper", [&]() {return grip(open_width_);});
+      step("Move to pre-grasp", [&]() {return move(pre_pick, false);});
+      step("Descend to grasp", [&]() {return move(pick, true);});
+      step(
+        "Close gripper", [&]() {
+          // The MoveIt attachment is a planning model, not proof of a physical grasp.
+          scene_->attach();
+          holding_ = true;
+          return grip(std::max(0.0, width - compression_));
+        });
 
       stage(Action::Feedback::TRANSFERRING, "Lifting and transferring");
-      step("Lift object", [&]() { return move(lifted, true); });
-      step("Transfer object", [&]() { return move(pre_place, false); });
+      step("Lift object", [&]() {return move(lifted, true);});
+      step("Transfer object", [&]() {return move(pre_place, false);});
 
       stage(Action::Feedback::PLACING, "Lowering, releasing and retreating");
-      step("Descend to place", [&]() { return move(put, true); });
-      step("Release object", [&]() {
-        if (!grip(open_width_)) {return false;}
-        scene_->release();
-        holding_ = false;
-        return true;
-      });
-      step("Retreat", [&]() { return move(put + tf2::Vector3(0, 0, retreat_), true); });
+      step("Descend to place", [&]() {return move(put, true);});
+      step(
+        "Release object", [&]() {
+          if (!grip(open_width_)) {return false;}
+          scene_->release();
+          holding_ = false;
+          return true;
+        });
+      step("Retreat", [&]() {return move(put + tf2::Vector3(0, 0, retreat_), true);});
       result->success = true;
       result->message = "Motion sequence completed; object placement needs visual verification";
     } catch (const std::exception & error) {
@@ -392,7 +414,6 @@ private:
   std::string frame_;
   tf2::Vector3 tool_to_tcp_, offset_;
   tf2::Quaternion tool_rotation_;
-  std::vector<double> signs_;
   double approach_, lift_, transport_z_, clearance_, retreat_;
   double open_width_, compression_, max_age_, tf_timeout_;
 };
@@ -400,11 +421,12 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<rclcpp::Node>("pick_place_executor",
+  auto node = std::make_shared<rclcpp::Node>(
+    "pick_place_executor",
     rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
   executor.add_node(node);
-  std::thread spin_thread([&]() { executor.spin(); });
+  std::thread spin_thread([&]() {executor.spin();});
   int result = 0;
   try {
     PickPlaceExecutor server(node);

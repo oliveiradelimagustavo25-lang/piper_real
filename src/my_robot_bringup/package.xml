@@ -3,12 +3,31 @@
 <package format="3">
   <name>my_robot_bringup</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Independent control, task planning and perception launch composition.</description>
   <maintainer email="oliveiradelimagustavo25@gmail.com">ltt</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>agx_arm_moveit</exec_depend>
+  <exec_depend>agx_arm_ctrl</exec_depend>
+  <exec_depend>my_robot_commander</exec_depend>
+  <exec_depend>my_robot_planner</exec_depend>
+  <exec_depend>my_robot_perception</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>xacro</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>control_msgs</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <test_depend>std_srvs</test_depend>
+  <test_depend>my_robot_interface</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

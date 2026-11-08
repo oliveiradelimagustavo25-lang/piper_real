@@ -335,6 +335,25 @@
   </xacro:if>
 
   <!-- ======================== HOME STATE ======================== -->
+  <!-- Piper targets from my_robot_moveit_pkg; real workspace validation pending. -->
+  <xacro:if value="$(eval arm_type == 'piper')">
+    <group_state name="pose_1" group="arm">
+      <joint name="joint1" value="0" />
+      <joint name="joint2" value="1.3006" />
+      <joint name="joint3" value="-0.6496" />
+      <joint name="joint4" value="0.0103" />
+      <joint name="joint5" value="0.7436" />
+      <joint name="joint6" value="0" />
+    </group_state>
+    <group_state name="pose_2" group="arm">
+      <joint name="joint1" value="0" />
+      <joint name="joint2" value="1.6164" />
+      <joint name="joint3" value="-2.3876" />
+      <joint name="joint4" value="-0.031" />
+      <joint name="joint5" value="-0.1516" />
+      <joint name="joint6" value="0" />
+    </group_state>
+  </xacro:if>
   <xacro:unless value="$(eval arm_type == 'nero')">
     <group_state name="home" group="arm">
       <joint name="joint1" value="0" />

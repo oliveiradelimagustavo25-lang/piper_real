@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*-coding:utf8-*-
+import time
+
 import rclpy
 from rclpy.node import Node
 from action_msgs.msg import GoalStatusArray
@@ -20,6 +22,7 @@ class ControlGate(Node):
 
         self._active_states = {1, 2, 3}  # ACCEPTED, EXECUTING, CANCELING
         self._gate_open = None
+        self._pending = None
         self._service_ready_logged = False
         self._topic_is_active = {}
 
@@ -33,39 +36,55 @@ class ControlGate(Node):
                 10,
             )
 
-        self._ready_timer = self.create_timer(0.2, self._ensure_initial_gate_closed)
+        self._sync_timer = self.create_timer(0.2, self._sync_gate)
         self.get_logger().info(
             f"Control gate started. status_topics={self.status_topics}, "
             f"gate_service_name={self.gate_service_name}"
         )
 
-    def _ensure_initial_gate_closed(self):
-        if not self._gate_client.wait_for_service(timeout_sec=0.0):
+    def _sync_gate(self):
+        if not self._gate_client.service_is_ready():
+            self._gate_open = None
+            self._service_ready_logged = False
+            if self._pending is not None:
+                self._gate_client.remove_pending_request(self._pending[0])
+                self._pending[0].cancel()
+                self._pending = None
             return
         if not self._service_ready_logged:
-            self.get_logger().info("Gate service is ready, forcing gate closed")
+            self.get_logger().info("Gate service is ready, synchronizing execution state")
             self._service_ready_logged = True
-        self._set_gate(False)
-        self._ready_timer.cancel()
+        if self._pending is not None:
+            future, requested, sent_at = self._pending
+            if not future.done() and time.monotonic() - sent_at < 2.0:
+                return
+            self._pending = None
+            try:
+                if not future.done():
+                    self._gate_client.remove_pending_request(future)
+                    future.cancel()
+                    raise TimeoutError("Gate service response timed out")
+                response = future.result()
+                if not response.success:
+                    raise RuntimeError(response.message or "Gate service rejected the request")
+                self._gate_open = requested
+                state = "opened" if requested else "closed"
+                self.get_logger().info(f"External control gate confirmed {state}")
+            except Exception as error:
+                self._gate_open = None  # A failed acknowledgement leaves the actual state unknown.
+                self.get_logger().warning(str(error), throttle_duration_sec=5.0)
+
+        desired = any(self._topic_is_active.values())
+        if self._gate_open != desired:
+            request = SetBool.Request()
+            request.data = desired
+            self._pending = (self._gate_client.call_async(request), desired, time.monotonic())
 
     def _status_callback(self, msg: GoalStatusArray, topic_name: str):
         self._topic_is_active[topic_name] = any(
             status.status in self._active_states for status in msg.status_list
         )
-        self._set_gate(any(self._topic_is_active.values()))
-
-    def _set_gate(self, open_gate: bool):
-        if self._gate_open is open_gate:
-            return
-        if not self._gate_client.wait_for_service(timeout_sec=0.0):
-            return
-
-        request = SetBool.Request()
-        request.data = open_gate
-        self._gate_client.call_async(request)
-        self._gate_open = open_gate
-        state = "opened" if open_gate else "closed"
-        self.get_logger().info(f"External control gate {state} by execution status")
+        self._sync_gate()
 
 
 def main(args=None):
@@ -77,7 +96,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

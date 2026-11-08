@@ -1,6 +1,6 @@
 # piper_real
 
-基于 ROS 2 的实物抓取框架，使用 AgileX Piper X、AGX 官方平行夹爪 `agx_gripper` 和安装在末端的 Vidu RGB-D 相机（眼在手上）。
+基于 ROS 2 的实物抓取框架，使用 AgileX Piper（`arm_type=piper`）、AGX 官方平行夹爪 `agx_gripper` 和安装在末端的 Vidu RGB-D 相机（眼在手上）。2026-11-08 已按用户更正的实际型号从 Piper X 调整为 Piper。
 
 当前阶段主要完成相机与视觉基础链路。机器人控制、规划与执行模块已经分包，但完整实机抓取、手眼标定和精度验收尚未完成。
 
@@ -14,7 +14,8 @@
 | `src/my_robot_interface/` | 上层模块共用的消息与 Action 定义 |
 | `src/my_robot_commander/` | MoveIt 运动封装、抓放执行器和碰撞场景管理 |
 | `src/my_robot_planner/` | 根据感知对象组织分拣任务，调用执行层 Action |
-| `src/my_robot_bringup/` | 预留启动包，当前尚无统一实机启动入口 |
+| `src/my_robot_bringup/` | 三个独立分层入口与总入口：控制、运动/行为规划、相机感知 |
+| `test/` | 集中 Python 测试入口，`native/` 保留实际 C++ 转换验证源，`upstream/` 保留驱动原有规范检查 |
 | `docs/` | 方案、集成缺口、实施说明和调试记录 |
 
 主要视觉数据流：
@@ -74,7 +75,80 @@ colcon build --packages-up-to my_robot_perception --cmake-args -DBUILD_TESTING=O
 source install/setup.bash
 ```
 
-需要构建完整工作区时使用 `colcon build`。本阶段的构建与测试结论主要覆盖视觉相关包，不代表完整实机链路已验收。
+需要构建完整工作区时使用 `colcon build`。当前验证覆盖视觉基础链路及机器人底层配置/mock 执行，不代表完整实机链路已验收。
+
+## 分层启动
+
+构建并加载完整启动栈：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to my_robot_bringup --cmake-args -DBUILD_TESTING=ON
+source install/setup.bash
+```
+
+三个入口均在 `my_robot_bringup`，分三个已加载环境的终端按顺序启动：
+
+```bash
+# 1. 底层：真实驱动、ros2_control、MoveIt、robot_state_publisher、RViz
+ros2 launch my_robot_bringup robot_control_moveit.launch.py control_mode:=real can_port:=can0
+
+# 2. 中层：抓放执行器、碰撞环境、任务规划器
+ros2 launch my_robot_bringup robot_motion_planning.launch.py control_mode:=real
+
+# 3. 上层：Vidu 相机与视觉处理
+ros2 launch my_robot_bringup robot_perception.launch.py perception_mode:=color show_window:=true
+```
+
+也可用总入口启动同一组合：
+
+```bash
+ros2 launch my_robot_bringup robot.launch.py control_mode:=real can_port:=can0 \
+  perception_mode:=color show_window:=true
+```
+
+底层和总入口的 `control_mode` 默认 `mock`，不会启动 CAN 驱动。真机模式的 `auto_enable` 默认 `false`，使能须按实际设备状态操作。上层和总入口的 `start_camera` 默认 `true`，会打开相机；离线验证示例：
+
+```bash
+ros2 launch my_robot_bringup robot.launch.py control_mode:=mock \
+  use_rviz:=false start_camera:=false show_window:=false
+```
+
+底层可以独立用 RViz/MoveIt 控制机器人；视觉可以独立检测并输出相机坐标结果。中层按开关仅装配启用的组件，关闭执行器时不读取它的运动学配置；执行器缺底层时等待规划场景服务；启动本身不派发抓取任务。总入口只组合三层、汇总参数，每层参数作用域独立。查看当前完整参数：
+
+```bash
+ros2 launch my_robot_bringup robot.launch.py --show-args
+```
+
+| 参数 | 范围与含义 |
+| --- | --- |
+| `control_mode` | 底层与中层共用 `mock/real`；分别启动时两者应一致 |
+| `can_port`、`auto_enable`、`tcp_offset`、`use_rviz` | 底层驱动、TCP 模型和显示配置 |
+| `start_executor`、`start_planner` | 中层分别启用现有抓放执行器、任务规划器；替换组件时可独立关闭 |
+| `manipulation_config`、`planner_config` | 抓放与任务配置 YAML，名称分开以免冲突 |
+| `perception_mode`、`perception_config` | 上层检测模式与 YAML；内部复用视觉模块的 `mode/config` |
+| `start_camera`、`enable_depth`、`show_window` | 上层采集、深度关联与窗口配置 |
+| `use_sim_time` | 三层共享，默认 `false`；mock 模式本身不产生 `/clock` |
+
+本组合面向根命名空间的单臂。官方 `/control/joint_states` 保持命令入口，`/feedback/joint_states` 保持实测反馈出口，未提供改名开关。MoveIt/RSP/执行器在 real 模式订阅反馈，在 mock 模式订阅模拟控制器状态。消费者的 `joint_states` 重映射不会改变官方驱动话题。
+
+`MotionController` 是底层对上的同步 C++ 控制接口，作为现有 `my_robot_commander` 的独立库目标导出，没有新增转发节点或 ROS 包。中层通过它调用基本运动，库本身不管理视觉、任务策略或碰撞环境。中层从底层发布的 `/robot_description`、`/robot_description_semantic` 读取模型，不重复生成另一份 URDF/SRDF；外部 C++ 调用者须提供持续 spin 的节点和运动学配置，并将 `joint_states` 订阅接到对应状态源。
+
+```cpp
+motion.moveToNamedTarget("pose_1");
+motion.moveGripperToWidth(0.04);                 // 绝对总开口 40 mm，单位 m
+motion.moveGripperToNamedTarget("gripper_half"); // 总开口 50 mm
+motion.openGripper();                           // 官方 gripper_open，100 mm
+motion.closeGripper();                          // 官方 gripper_close，0 mm
+```
+
+夹爪命名状态只保留官方 `gripper_open/gripper_half/gripper_close`，已移除新增的 `open/close` 别名。数值宽度不依赖命名状态，抓放 YAML 的 `gripper_open_width` 仍为 0.07 m。独立关节 `gripper` 表示总开口，`gripper_joint1/2` 由模型 mimic 派生，不使用旧 `joint7/joint8` 手指向量。arm 保留 `pose_1/pose_2`；真实支架、桌面和运动路径仍需实物确认。
+
+接口长度为 m、角度为 rad；输入或规划/执行被拒时返回 false，配置及 ROS/MoveIt 异常可向调用者抛出。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示 MoveIt 报告轨迹成功，不表示已确认真机到位或夹住物体。当前库不提供运动中取消，执行器 Action 在当前基本动作结束后取消后续步骤。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。更换行为规划节点可复用这些 Action；更换轨迹规划算法由底层 MoveIt pipeline 配置负责。
+
+相机挂载 TF 留待手眼标定，未迁入参考项目的错误外参；缺机器人 TF 时，相机二维检测和相机系测量仍可独立工作，`base_link` 物体输出尚不完整。`tcp_offset` 默认零，执行器 `tool_to_tcp` 仍需实际核对。启动层不再管理 Octomap 开关；当前没有启用相机障碍输入，固定碰撞环境由中层管理。
+
+当前真机路径仍沿用 AGX 的 mock 控制器到 SDK 的命令桥接，未将硬件反馈写入 ros2_control state interface；控制器成功不能证明真机到位。本机 MoveIt 2.5.10 的退出阶段 `move_group` 段错误尚未修复，本次分层重构不代表真机闭环或正常退出已验收。记录见 [分层构建报告](docs/real_grasp_integration_gaps.md#9-三层启动与接口边界2026-11-08)。
 
 ## 视觉启动与参数
 
@@ -130,17 +204,27 @@ RViz 看图使用 Image 显示项。单独查看相机点云时可将 Fixed Fram
 
 ## 验证与当前边界
 
-不连接相机也可运行现有合成回归：
+测试源码集中在根目录 `test/`，保留各包的 CMake 测试注册：
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-colcon test --packages-select vidu_ros2_wrapper my_robot_perception \
+colcon test --packages-select my_robot_bringup vidu_ros2_wrapper my_robot_perception \
   --event-handlers console_direct+
 colcon test-result --verbose
 ```
 
-最近一次代码回归：8 项 C++ 和 15 项 Python 功能用例通过；8 组 mode/窗口组合通过。完整两包检查为 0 failures，另有 8 项 cppcheck 检查因本机工具版本跳过。这些结果不等于实机抓取精度或长期稳定性验收。
+也可直接运行集中 Python 功能测试（先完成带测试的构建）：
+
+```bash
+ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
+  python3 -m pytest -q test/test_robot_configuration.py test/test_robot_launch.py \
+  test/test_visual_pipeline.py test/test_conversions.py
+```
+
+配置检查不启动节点；启动集成测试强制使用隔离域 175、mock 控制器、无相机、无窗口，验证分层独立性、依赖等待、命名姿态和 40 mm 总开口。视觉合成回归不打开真实相机。`test/native/test_conversions.cpp` 仅作为 Python 调用的原生验证程序源，保留对真实 C++ SDK 转换的 8 项检查；没有在 Python 里复制转换算法。`test/upstream/` 是迁移后的驱动原有 lint 检查，可用 `python3 -m pytest -q test/upstream` 单独运行；当前仍有原驱动的格式/文档字符串报错，不属于上述功能测试命令。
+
+2026-11-08 分层验证：11 包构建通过；22 项模型/启动配置、2 项独立与总入口 mock 联动、1 项控制门恢复测试、15 项视觉回归及原生转换程序的 8 项检查通过。Piper mock 联动验证了无自动运动、底层模型读取、pose_1/pose_2 与 40 mm 总开口，未启动真机或相机。MoveIt 退出段错误仍作为明确警告记录，不能据此认定退出稳定性通过。
 
 2026-11-07 用户实测反馈：已测试四个场景的实时检测，color 效果改善，部分物体识别较准确。本阶段接受保留以下问题，后续再处理：
 
@@ -152,6 +236,6 @@ colcon test-result --verbose
 
 `-- mm` 表示当前关联不足，不发布猜测距离。现有前景边界检查依赖局部平面与外围有效深度；复杂遮挡、物体内部色块或缺少外围测量时可能拒绝三维关联。当前几何配置仍是 1 cm 小物块，不适用于任意红盒/杯盖的抓取中心估计。眼在手上的标定 TF、世界系稳定性与完整机器人执行闭环仍待后续集成。
 
-详细记录：[相机实施说明](docs/camera_vision_implementation.md)、[联调报告](docs/camera_debugging_report.md)、[抓取集成缺口](docs/real_grasp_integration_gaps.md)。当前 `.gitignore` 忽略 `docs/`，这些本地文档尚不会自动随代码交付；因此主要使用方法和待办同时保留在本 README。
+详细记录：[相机实施说明](docs/camera_vision_implementation.md)、[联调报告](docs/camera_debugging_report.md)、[集成缺口、规划与底层合并记录](docs/real_grasp_integration_gaps.md)。已结合参考项目补齐底层配置，后续继续处理依赖退出缺陷、手眼标定、真实环境与执行反馈；视觉精度问题按计划后续处理。当前 `.gitignore` 忽略 `docs/`，这些本地文档尚不会自动随代码交付；因此主要使用方法和待办同时保留在本 README。
 
 仓库含多个上游组件，许可请分别查看对应包及厂商 SDK 的声明。

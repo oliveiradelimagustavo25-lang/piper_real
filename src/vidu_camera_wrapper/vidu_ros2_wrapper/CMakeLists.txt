@@ -34,9 +34,13 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_conversions test/test_conversions.cpp
-    ENV ROS_DOMAIN_ID=174 ROS_LOCALHOST_ONLY=1)
-  target_link_libraries(test_conversions vidu_conversions)
+  find_package(ament_cmake_pytest REQUIRED)
+  set(WORKSPACE_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../test)
+  ament_add_gtest_executable(conversion_probe ${WORKSPACE_TEST_DIR}/native/test_conversions.cpp)
+  target_link_libraries(conversion_probe vidu_conversions)
+  ament_add_pytest_test(conversions ${WORKSPACE_TEST_DIR}/test_conversions.py TIMEOUT 40
+    ENV VIDU_CONVERSION_PROBE=$<TARGET_FILE:conversion_probe>
+      ROS_DOMAIN_ID=174 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/ros_logs)
 endif()
 
 ament_package()

@@ -58,9 +58,10 @@ moveit_msgs::msg::PlanningScene diff()
 PickPlaceScene::PickPlaceScene(
   const rclcpp::Node::SharedPtr & node, tf2_ros::Buffer & tf,
   const std::string & frame, const std::string & tool_link)
-: node_(node), tf_(tf), frame_(frame), tool_link_(tool_link)
+: node_(node), tf_(tf), frame_(frame), tool_link_(tool_link), scene_(node->get_namespace())
 {
-  touch_links_ = parameter<std::vector<std::string>>(node_, "touch_links", {"link7", "link8"});
+  touch_links_ = parameter<std::vector<std::string>>(
+    node_, "touch_links", {"gripper_link1", "gripper_link2"});
   get_scene_ = node_->create_client<moveit_msgs::srv::GetPlanningScene>("get_planning_scene");
   auto update = diff();
   collision_detection::AllowedCollisionMatrix matrix(collisionMatrix());
