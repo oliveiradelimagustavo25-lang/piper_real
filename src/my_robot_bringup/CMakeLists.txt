@@ -15,6 +15,8 @@ if(BUILD_TESTING)
     ENV ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/ros_logs)
   ament_add_pytest_test(robot_launch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test/test_robot_launch.py TIMEOUT 120)
+  ament_add_pytest_test(handeye
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../test/test_handeye.py TIMEOUT 90)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

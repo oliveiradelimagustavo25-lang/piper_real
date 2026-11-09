@@ -9,14 +9,11 @@ pick_place_executor:
     objects_topic: /perception/objects
     touch_links: [gripper_link1, gripper_link2]
 
-    # 与 preview.xml 地面和 objects/aruco_board.xml 的尺寸、位姿保持一致。
-    scene_boxes: [ground, aruco_board]
+    # 实测桌面比 base_link 安装面低 145 mm；纸质标记板与桌面共面。
+    scene_boxes: [ground]
     scene.ground.size: [4.0, 4.0, 0.02]
-    scene.ground.position: [0.0, 0.0, -0.01]
+    scene.ground.position: [0.0, 0.0, -0.155]
     scene.ground.rpy: [0.0, 0.0, 0.0]
-    scene.aruco_board.size: [0.2, 0.01, 0.2]
-    scene.aruco_board.position: [0.5, 0.0, 0.1]
-    scene.aruco_board.rpy: [0.0, 0.0, 1.57079632679]
 
     velocity_scaling: 0.2
     acceleration_scaling: 0.2
@@ -26,8 +23,8 @@ pick_place_executor:
     # link6 到夹持中心的平移；已通过当前 1 cm / 3 cm 物块仿真，实机需标定。
     tool_to_tcp: [0.0, 0.0, 0.132]
     grasp_rpy: [0.0, 3.141592653589793, 0.0]  # rad，固定向下抓取
-    # 保留指尖与地面的净空；该偏移基于当前 MuJoCo 1 cm 物块验证，实机需重新标定。
-    grasp_offset: [0.0, 0.0, 0.01]  # 物块中心到夹持中心，基座坐标系，m
+    # 输入已是物体几何中心，不沿用 1 cm 仿真物块的额外抬高。
+    grasp_offset: [0.0, 0.0, 0.0]
 
     approach_distance: 0.04      # 物块上方的预抓取距离，m
     lift_distance: 0.06          # 抓取后的最小抬升距离，m
@@ -35,10 +32,11 @@ pick_place_executor:
     release_clearance: 0.002     # 放置时让物块底面略高于目标支撑面，m
     retreat_distance: 0.04       # 松开后向上撤离距离，m
 
-    # AGX 独立 gripper 关节表示总开口宽度；手指由模型 mimic 派生。
+    # AGX 独立 gripper 关节表示未扣除垫片的机械总开口；手指由模型 mimic 派生。
     gripper_width_joint: gripper
-    gripper_open_width: 0.07
-    gripper_compression: 0.002   # 总开口比物块小 2 mm，每侧 1 mm 的目标余量形成夹持力
+    gripper_open_width: 0.095    # 预张开宽度；当前模型上限 0.1 m，启动时校验
+    gripper_pad_thickness: 0.003 # 每侧内表面垫片厚度；净开口=关节读数-两侧厚度
+    gripper_compression: 0.002   # 垫片间净开口比物块小 2 mm；不改变关节宽度接口的语义
 
     max_target_age: 5.0          # 有时间戳的观测允许年龄，s；零时间戳用于手动目标
     tf_timeout: 0.3              # 坐标转换等待上限，s

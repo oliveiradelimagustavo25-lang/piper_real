@@ -1,0 +1,20 @@
+parameters:
+  name: piper_vidu
+  calibration_type: eye_in_hand
+  robot_base_frame: base_link
+  robot_effector_frame: link6
+  tracking_base_frame: camera_color_optical_frame
+  tracking_marker_frame: aruco_marker_9
+  freehand_robot_movement: true
+  move_group_namespace: /
+  move_group: manipulator
+transform:
+  translation:
+    x: -0.0606778500430322
+    y: 0.0133954515388402
+    z: 0.06086054960021818
+  rotation:
+    x: -0.0007306132938417523
+    y: 0.011273340293296297
+    z: -0.7021987154254383
+    w: 0.7118913836096841

@@ -17,17 +17,20 @@ find_package(std_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Vidu_SDK_Api REQUIRED)
 find_package(vidu_ros2_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 # Internal SDK-to-ROS conversion/calibration helpers, shared with offline tests.
 add_library(vidu_conversions STATIC src/conversions.cpp)
 target_include_directories(vidu_conversions PUBLIC include ${OpenCV_INCLUDE_DIRS})
-ament_target_dependencies(vidu_conversions rclcpp sensor_msgs camera_info_manager)
+ament_target_dependencies(vidu_conversions rclcpp sensor_msgs camera_info_manager geometry_msgs tf2)
 target_link_libraries(vidu_conversions Vidu_SDK_Api::GenTLwrapper ${OpenCV_LIBS})
 
 add_executable(${PROJECT_NAME}_node src/vidu_ros2_wrapper.cpp)
 target_link_libraries(${PROJECT_NAME}_node vidu_conversions)
 ament_target_dependencies(${PROJECT_NAME}_node
-  rclcpp rcl_interfaces cv_bridge std_msgs sensor_msgs vidu_ros2_interfaces)
+  rclcpp rcl_interfaces cv_bridge std_msgs sensor_msgs vidu_ros2_interfaces tf2_ros)
 install(TARGETS ${PROJECT_NAME}_node DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)

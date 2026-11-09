@@ -90,6 +90,25 @@ struct MotionController::Impl
     }
     return planAndExecute(group);
   }
+
+  std::pair<double, double> widthLimits() const
+  {
+    const auto model = gripper->getRobotModel();
+    const auto * group = model->getJointModelGroup(options.gripper_group);
+    const auto & joints = group->getActiveJointModelNames();
+    if (joints.size() != 1 || joints.front() != options.gripper_width_joint ||
+      model->getJointModel(joints.front())->getType() != moveit::core::JointModel::PRISMATIC)
+    {
+      throw std::invalid_argument("Width control requires one prismatic gripper joint");
+    }
+    const auto & bounds = model->getVariableBounds(options.gripper_width_joint);
+    if (!bounds.position_bounded_ || !std::isfinite(bounds.min_position_) ||
+      !std::isfinite(bounds.max_position_) || bounds.min_position_ >= bounds.max_position_)
+    {
+      throw std::invalid_argument("Gripper width requires finite model position limits");
+    }
+    return {bounds.min_position_, bounds.max_position_};
+  }
 };
 
 MotionController::MotionController(const rclcpp::Node::SharedPtr & node)
@@ -228,14 +247,9 @@ bool MotionController::moveGripperToWidth(double width)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto & gripper = *impl_->gripper;
-  const auto * model = gripper.getRobotModel()->getJointModelGroup(impl_->options.gripper_group);
-  const auto & joints = model->getActiveJointModelNames();
-  if (!std::isfinite(width) || width < 0 || joints.size() != 1 ||
-    joints.front() != impl_->options.gripper_width_joint ||
-    gripper.getRobotModel()->getJointModel(joints.front())->getType() !=
-    moveit::core::JointModel::PRISMATIC)
-  {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Width control requires one prismatic gripper joint");
+  const auto limits = impl_->widthLimits();
+  if (!std::isfinite(width) || width < limits.first || width > limits.second) {
+    RCLCPP_ERROR(impl_->node->get_logger(), "Gripper width is outside model limits");
     return false;
   }
   gripper.setStartStateToCurrentState();
@@ -247,6 +261,12 @@ bool MotionController::moveGripperToWidth(double width)
     return false;
   }
   return impl_->planAndExecute(gripper);
+}
+
+std::pair<double, double> MotionController::gripperWidthLimits() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->widthLimits();
 }
 
 }  // namespace my_robot_commander

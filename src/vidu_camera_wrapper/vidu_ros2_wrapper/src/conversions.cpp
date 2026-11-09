@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "vidu_ros2_wrapper/conversions.hpp"
+#include <tf2/LinearMath/Matrix3x3.h>
 
 #include <GenICam/PFNC.h>
 
@@ -29,6 +30,47 @@
 
 namespace vidu_ros2
 {
+void validate_extrinsics(const extrinsics & transform)
+{
+  cv::Matx33d rotation;
+  for (int i = 0; i < 9; ++i) {
+    rotation.val[i] = transform.rotation[i];
+  }
+  const cv::Vec3d translation(
+    transform.translation[0], transform.translation[1], transform.translation[2]);
+  if (!cv::checkRange(cv::Mat(rotation)) || !cv::checkRange(cv::Mat(translation)) ||
+    cv::norm(rotation * rotation.t() - cv::Matx33d::eye()) > 1e-4 ||
+    std::abs(cv::determinant(rotation) - 1.0) > 1e-4)
+  {
+    throw std::runtime_error("Invalid SDK depth-to-color extrinsics");
+  }
+}
+
+geometry_msgs::msg::TransformStamped depth_to_color_tf(
+  const extrinsics & transform, const std_msgs::msg::Header & color_header,
+  const std::string & depth_frame)
+{
+  validate_extrinsics(transform);
+  if (color_header.frame_id.empty() || depth_frame.empty() ||
+    color_header.frame_id == depth_frame)
+  {
+    throw std::runtime_error("Invalid RGB/depth optical TF frames");
+  }
+  geometry_msgs::msg::TransformStamped result;
+  result.header = color_header;
+  result.child_frame_id = depth_frame;
+  auto & output = result.transform;
+  output.translation.x = transform.translation[0];
+  output.translation.y = transform.translation[1];
+  output.translation.z = transform.translation[2];
+  const auto * r = transform.rotation;
+  tf2::Quaternion q;
+  tf2::Matrix3x3(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]).getRotation(q);
+  q.normalize();
+  output.rotation.x = q.x(); output.rotation.y = q.y();
+  output.rotation.z = q.z(); output.rotation.w = q.w();
+  return result;
+}
 namespace
 {
 bool valid_point(const cv::Vec3f & p)
@@ -240,6 +282,7 @@ bool CalibrationCache::refresh(
 {
   try {
     auto candidate = load_info(node, name, url, camera_info(intrinsic), name == "depth");
+    if (name == "color") {validate_extrinsics(transform);}
     info = std::move(candidate);
     extrinsic = transform;
     valid = true;

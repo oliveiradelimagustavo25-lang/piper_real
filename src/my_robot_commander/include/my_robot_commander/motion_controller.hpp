@@ -4,6 +4,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -52,6 +53,7 @@ public:
   bool moveGripperToNamedTarget(const std::string & name);
   bool moveGripperToJoints(const std::vector<double> & joints);
   bool moveGripperToWidth(double width);  // 绝对总开口，0.04 表示 40 mm。
+  std::pair<double, double> gripperWidthLimits() const;  // MoveIt 模型中的总开口范围，m。
   bool openGripper();
   bool closeGripper();
 

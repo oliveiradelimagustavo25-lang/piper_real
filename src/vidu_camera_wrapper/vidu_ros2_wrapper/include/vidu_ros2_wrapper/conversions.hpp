@@ -21,6 +21,7 @@
 #include <opencv2/core.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include "Vidu_SDK_Api.h"
 
 namespace vidu_ros2
@@ -29,6 +30,11 @@ cv::Mat image_view(const PDimage & image, int expected_type);
 // auto follows PFNC; explicit rgb/bgr describes verified SDK buffer bytes.
 cv::Mat to_bgr(const PDimage & image, const std::string & input_order = "auto");
 cv::Mat depth_metres(const cv::Mat & xyz);
+void validate_extrinsics(const extrinsics & transform);
+// SDK RGB extrinsics map depth points into RGB: P_color = R * P_depth + t.
+geometry_msgs::msg::TransformStamped depth_to_color_tf(
+  const extrinsics & transform, const std_msgs::msg::Header & color_header,
+  const std::string & depth_frame);
 sensor_msgs::msg::PointCloud2 to_cloud(
   const cv::Mat & bgr, const cv::Mat & xyz, const std_msgs::msg::Header & header);
 sensor_msgs::msg::CameraInfo camera_info(const intrinsics & intrinsic);

@@ -110,11 +110,14 @@ public:
     transport_z_ = parameter(node_, "transport_height", 0.08);
     clearance_ = parameter(node_, "release_clearance", 0.002);
     retreat_ = parameter(node_, "retreat_distance", 0.04);
-    open_width_ = parameter(node_, "gripper_open_width", 0.07);
+    open_width_ = parameter(node_, "gripper_open_width", 0.095);
+    pad_thickness_ = parameter(node_, "gripper_pad_thickness", 0.0);
     compression_ = parameter(node_, "gripper_compression", 0.002);
     max_age_ = parameter(node_, "max_target_age", 5.0);
     tf_timeout_ = parameter(node_, "tf_timeout", 0.3);
-    if (open_width_ <= 0 || compression_ < 0 ||
+    if (!std::isfinite(open_width_) || !std::isfinite(pad_thickness_) ||
+      !std::isfinite(compression_) || pad_thickness_ < 0 ||
+      open_width_ <= 2 * pad_thickness_ || compression_ < 0 ||
       approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0)
     {
       throw std::invalid_argument("Invalid gripper configuration or approach/lift/retreat distances");
@@ -132,6 +135,13 @@ public:
         "Waiting for control stack: get_planning_scene");
     }
     motion_ = std::make_unique<Motion>(node_, options);
+    const auto width_limits = motion_->gripperWidthLimits();
+    if (open_width_ < width_limits.first || open_width_ > width_limits.second) {
+      throw std::invalid_argument("gripper_open_width is outside the loaded robot model limits");
+    }
+    RCLCPP_INFO(
+      node_->get_logger(), "Gripper width limits [%.3f, %.3f] m; opening %.3f m",
+      width_limits.first, width_limits.second, open_width_);
     scene_ = std::make_unique<Scene>(node_, tf_buffer_, frame_, options.end_effector_link);
     objects_sub_ = node_->create_subscription<my_robot_interface::msg::DetectedObjectArray>(
       parameter<std::string>(node_, "objects_topic", "/perception/objects"), 10,
@@ -320,8 +330,8 @@ private:
       const auto object = inBase(goal->object_pose);
       const auto place = inBase(goal->place_pose);
       const double width = graspWidth(object.pose, goal->object_dimensions, tool_rotation_);
-      if (width >= open_width_) {
-        throw std::runtime_error("Object is wider than configured gripper opening");
+      if (width + 2 * pad_thickness_ >= open_width_) {
+        throw std::runtime_error("Object is wider than the clear opening between gripper pads");
       }
       const tf2::Vector3 pick = tf2::Vector3(
         object.pose.position.x,
@@ -353,7 +363,7 @@ private:
           // The MoveIt attachment is a planning model, not proof of a physical grasp.
           scene_->attach();
           holding_ = true;
-          return grip(std::max(0.0, width - compression_));
+          return grip(2 * pad_thickness_ + std::max(0.0, width - compression_));
         });
 
       stage(Action::Feedback::TRANSFERRING, "Lifting and transferring");
@@ -415,7 +425,7 @@ private:
   tf2::Vector3 tool_to_tcp_, offset_;
   tf2::Quaternion tool_rotation_;
   double approach_, lift_, transport_z_, clearance_, retreat_;
-  double open_width_, compression_, max_age_, tf_timeout_;
+  double open_width_, pad_thickness_, compression_, max_age_, tf_timeout_;
 };
 
 int main(int argc, char ** argv)

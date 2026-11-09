@@ -79,6 +79,12 @@ source install/setup.bash
 
 ## 分层启动
 
+眼在手上标定使用独立入口：`bash script/handeye_calibration.sh`。脚本配置位于
+[`config/handeye_calibration/`](config/handeye_calibration/)，样本和结果默认保存到工作区
+`calibration/handeye/`；按同名结果是否存在自动选择采集或发布。
+首次构建、实物操作、服务命令和结果验证见[手眼标定操作说明](docs/handeye_calibration.md)。
+修改配置后重启即可，无需重新构建；脚本支持 `--dry-run` 和 `--recalibrate`。
+
 构建并加载完整启动栈：
 
 ```bash

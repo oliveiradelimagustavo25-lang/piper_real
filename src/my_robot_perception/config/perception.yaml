@@ -3,7 +3,7 @@ color_detector:
     image_topic: /camera/color/origin
     # 深度只用于同帧标注，缺失时保留二维识别并显示 -- mm。
     depth_points_topic: /perception/object_points
-    display_timeout: 0.15
+    display_timeout: 0.35      # Same-frame localization measured ~0.20 s; bounded wait, no reuse.
     input_timeout: 1.0         # RGB 断流后清除旧深度标注，显示 STALE
     labels_topic: /perception/color_labels
     debug_topic: /perception/color_debug
@@ -39,7 +39,7 @@ depth_localizer:
     target_frame: ""             # 空字符串：相机光学系；可改为 base_link
     objects_topic: /perception/objects
     objects_frame: base_link     # Z 轴向上的坐标系，物体中心位姿使用此坐标系
-    object_dimensions: [0.01, 0.01, 0.01]  # 当前三色物块的已知尺寸，m
+    object_dimensions: [0.05, 0.05, 0.05]  # 当前实物方块 50 mm；更换物体时同步修改
     top_surface_tolerance: 0.002 # 上部点的高度容差，m；要求物块平放且顶部可见
     tf_timeout: 0.1              # s，等待采集时刻的 TF 到达，避免图像略早于关节 TF
     sync_slop: 0.03               # RGB 标签与深度时间差上限，单位 s

@@ -15,6 +15,7 @@
 // Adapted from Point Spread's Apache-2.0 ROS wrapper; notice covers local changes.
 
 #include <cv_bridge/cv_bridge.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 
 #include <algorithm>
 #include <chrono>
@@ -62,6 +63,8 @@ void run(const rclcpp::Node::SharedPtr & node)
     "color_frame_id", "camera_color_optical_frame", startup_only);
   const auto depth_frame = node->declare_parameter<std::string>(
     "depth_frame_id", "camera_depth_optical_frame", startup_only);
+  const auto publish_tf = node->declare_parameter<bool>("publish_tf", true, startup_only);
+  tf2_ros::StaticTransformBroadcaster optical_tf(node);
   const auto color_url = node->declare_parameter<std::string>(
     "color_camera_info_url", "",
     startup_only);
@@ -139,6 +142,11 @@ void run(const rclcpp::Node::SharedPtr & node)
           calibration_stream.getCamPara(intrinsic, transform),
           "Cannot read " + name + " calibration");
         if (cache.refresh(*node, name, url, intrinsic, transform, error)) {
+          if (name == "color" && publish_tf) {
+            std_msgs::msg::Header header;
+            header.stamp = node->now(); header.frame_id = color_frame;
+            optical_tf.sendTransform(vidu_ros2::depth_to_color_tf(transform, header, depth_frame));
+          }
           RCLCPP_INFO(
             node->get_logger(), "%s: SDK model=%d -> %s, %ux%u",
             name.c_str(), static_cast<int>(intrinsic.model), cache.info.distortion_model.c_str(),

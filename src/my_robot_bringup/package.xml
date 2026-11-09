@@ -13,6 +13,7 @@
   <exec_depend>my_robot_commander</exec_depend>
   <exec_depend>my_robot_planner</exec_depend>
   <exec_depend>my_robot_perception</exec_depend>
+  <exec_depend>easy_handeye2</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>

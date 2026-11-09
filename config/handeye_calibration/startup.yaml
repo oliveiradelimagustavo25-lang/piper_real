@@ -1,0 +1,20 @@
+# Consumed by script/handeye_calibration.sh, not by a bringup launch.
+# Relative file paths are resolved against the workspace root.
+environment:
+  ros_distro: humble
+  ros_domain_id: 189
+
+handeye_config: config/handeye_calibration/easy_handeye2.yaml
+data_directory: calibration/handeye
+
+# Only used in calibrate mode. Publish mode starts the saved-TF publisher alone.
+launch:
+  start_control: true          # false if the real control launch is already running
+  can_port: can0               # Activate CAN separately before starting real control.
+  auto_enable: true
+  use_rviz: true
+  start_camera: true           # false if Vidu is already publishing; avoid duplicate ArUco nodes
+  show_window: true
+  show_gui: true
+  use_sim_time: false
+  perception_config: src/my_robot_perception/config/perception.yaml

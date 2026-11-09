@@ -141,8 +141,10 @@ public:
       });
 
     // 按采集时间匹配；颜色标签图保留了原 RGB 图的时间戳。
-    labels_sub_.subscribe(this, labels_topic, rmw_qos_profile_sensor_data);
-    depth_sub_.subscribe(this, depth_topic, rmw_qos_profile_sensor_data);
+    auto input_qos = rmw_qos_profile_sensor_data;
+    input_qos.depth = 1;  // Prefer fresh observations over processing a sensor backlog.
+    labels_sub_.subscribe(this, labels_topic, input_qos);
+    depth_sub_.subscribe(this, depth_topic, input_qos);
     labels_sub_.registerCallback(
       [this](Image::ConstSharedPtr labels) {
         if (last_labels_header_.frame_id.empty()) {
@@ -164,7 +166,7 @@ public:
         }
       });
     sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-      SyncPolicy(10), labels_sub_, depth_sub_);
+      SyncPolicy(3), labels_sub_, depth_sub_);
     sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(sync_slop));
     sync_->registerCallback(
       std::bind(
@@ -367,6 +369,82 @@ private:
     }
   }
 
+  bool estimate_object_center(
+    const std::vector<tf2::Vector3> & surface, const cv::Point2d & pixel,
+    const sensor_msgs::msg::CameraInfo & camera, const tf2::Transform & camera_to_objects,
+    geometry_msgs::msg::Point & center) const
+  {
+    std::vector<float> heights;
+    for (const auto & point : surface) {heights.push_back(point.z());}
+    std::sort(heights.begin(), heights.end());
+    size_t best_begin = 0, best_end = 0, end = 0;
+    for (size_t begin = 0; begin < heights.size(); ++begin) {
+      while (end < heights.size() && heights[end] - heights[begin] <= 2 * top_tolerance_) {
+        ++end;
+      }
+      if (end - begin > best_end - best_begin) {best_begin = begin; best_end = end;}
+    }
+    // A visible top face forms a height mode. A vertical side alone does not.
+    if (best_end - best_begin < static_cast<size_t>(min_pixels_) ||
+      best_end - best_begin < surface.size() / 4) {return false;}
+    std::vector<cv::Point3f> band;
+    for (const auto & point : surface) {
+      if (point.z() >= heights[best_begin] - 1e-6 && point.z() <= heights[best_end - 1] + 1e-6) {
+        band.emplace_back(point.x(), point.y(), point.z());
+      }
+    }
+    if (band.size() < static_cast<size_t>(min_pixels_)) {return false;}
+    const auto fit = [](const std::vector<cv::Point3f> & points) {
+        return cv::PCA(
+          cv::Mat(
+            static_cast<int>(points.size()), 3, CV_32F,
+            const_cast<cv::Point3f *>(points.data())), cv::Mat(), cv::PCA::DATA_AS_ROW);
+      };
+    auto plane = fit(band);
+    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return false;}
+    const cv::Vec3f normal(plane.eigenvectors.at<float>(2, 0),
+      plane.eigenvectors.at<float>(2, 1), plane.eigenvectors.at<float>(2, 2));
+    const cv::Vec3f origin(plane.mean.at<float>(0, 0), plane.mean.at<float>(0, 1),
+      plane.mean.at<float>(0, 2));
+    std::vector<float> residuals;
+    for (const auto & point : band) {
+      residuals.push_back(std::abs(normal.dot(cv::Vec3f(point.x, point.y, point.z) - origin)));
+    }
+    const double tolerance = top_tolerance_ + 3 * median(residuals);
+    std::vector<cv::Point3f> top;
+    for (const auto & point : surface) {
+      const cv::Vec3f p(point.x(), point.y(), point.z());
+      if (std::abs(normal.dot(p - origin)) <= tolerance) {
+        top.emplace_back(p);
+      }
+    }
+    if (top.size() < static_cast<size_t>(min_pixels_)) {return false;}
+    plane = fit(top);
+    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return false;}
+    // RGB determines lateral position; depth holes must not move the object centre.
+    const cv::Mat k(3, 3, CV_64F, const_cast<double *>(camera.k.data()));
+    std::vector<cv::Point2d> rays;
+    if (camera.distortion_model == "equidistant") {
+      cv::fisheye::undistortPoints(std::vector<cv::Point2d>{pixel}, rays, k, cv::Mat(camera.d));
+    } else {
+      cv::undistortPoints(std::vector<cv::Point2d>{pixel}, rays, k, cv::Mat(camera.d));
+    }
+    const tf2::Vector3 direction = camera_to_objects.getBasis() *
+      tf2::Vector3(rays[0].x, rays[0].y, 1);
+    const tf2::Vector3 n(plane.eigenvectors.at<float>(2, 0),
+      plane.eigenvectors.at<float>(2, 1), plane.eigenvectors.at<float>(2, 2));
+    const tf2::Vector3 mean(plane.mean.at<float>(0, 0),
+      plane.mean.at<float>(0, 1), plane.mean.at<float>(0, 2));
+    const double denominator = n.dot(direction);
+    if (std::abs(denominator) < 1e-6) {return false;}
+    const double distance = n.dot(mean - camera_to_objects.getOrigin()) / denominator;
+    if (!std::isfinite(distance) || distance <= 0) {return false;}
+    const auto position = camera_to_objects.getOrigin() + distance * direction;
+    center.x = position.x(); center.y = position.y();
+    center.z = position.z() - dimensions_.z / 2;
+    return std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(center.z);
+  }
+
   void localize(const Image::ConstSharedPtr & labels_msg, const Image::ConstSharedPtr & depth_msg)
   {
     last_pair_received_ = std::chrono::steady_clock::now();
@@ -395,7 +473,7 @@ private:
         if (labels_msg->header.frame_id != objects_frame_) {
           const auto transform = tf_buffer_->lookupTransform(
             objects_frame_, labels_msg->header.frame_id, rclcpp::Time(labels_msg->header.stamp),
-            rclcpp::Duration::from_seconds(0));
+            rclcpp::Duration::from_seconds(tf_timeout_));
           tf2::fromMsg(transform.transform, camera_to_objects);
         }
       } catch (const tf2::TransformException & error) {
@@ -468,40 +546,25 @@ private:
 
           // 第一版：平放、轴向对齐的已知尺寸物块，每种颜色保留最大连通区域。
           const int area = stats.at<int>(id, cv::CC_STAT_AREA);
-          if (objects_tf_ready && area > best_areas[color - 1]) {
+          if (objects_tf_ready && area > best_areas[color - 1] && box.x > 0 && box.y > 0 &&
+            box.br().x < labels->image.cols && box.br().y < labels->image.rows)
+          {
             std::vector<tf2::Vector3> surface;
-            std::vector<float> heights;
             for (size_t i = 0; i < inlier_points.size(); ++i) {
               const auto point = camera_to_objects * tf2::Vector3(
                 inlier_points[i].x, inlier_points[i].y, inlier_points[i].z);
               surface.push_back(point);
-              heights.push_back(point.z());
             }
-            std::sort(heights.begin(), heights.end());
-            const double upper_z = heights[heights.size() * 9 / 10];
-            tf2::Vector3 lower(1e9, 1e9, 0), upper(-1e9, -1e9, 0);
-            std::vector<float> top_heights;
-            for (const auto & point : surface) {
-              if (std::abs(point.z() - upper_z) <= top_tolerance_) {
-                lower.setX(std::min(lower.x(), point.x()));
-                lower.setY(std::min(lower.y(), point.y()));
-                upper.setX(std::max(upper.x(), point.x()));
-                upper.setY(std::max(upper.y(), point.y()));
-                top_heights.push_back(point.z());
-              }
-            }
-            RCLCPP_DEBUG(
-              get_logger(), "color=%d area=%d surface=%zu top=%zu upper_z=%.5f",
-              color, area, surface.size(), top_heights.size(), upper_z);
-            if (top_heights.size() >= static_cast<size_t>(min_pixels_)) {
+            geometry_msgs::msg::Point center;
+            const cv::Point2d pixel(box.x + (box.width - 1) / 2.0, box.y + (box.height - 1) / 2.0);
+            const auto & camera = labels_msg->header.frame_id == info_->header.frame_id ?
+              info_ : color_info_;
+            if (estimate_object_center(surface, pixel, *camera, camera_to_objects, center)) {
               auto & object = best_objects[color - 1];
               object.object_id = ids[color - 1];
               object.color = color;
               object.dimensions = dimensions_;
-              object.pose.position.x = (lower.x() + upper.x()) / 2;
-              object.pose.position.y = (lower.y() + upper.y()) / 2;
-              // objects_frame 的 Z 轴向上；上表面高度减半高得到物体中心。
-              object.pose.position.z = median(top_heights) - dimensions_.z / 2;
+              object.pose.position = center;
               object.pose.orientation.w = 1.0;
               best_areas[color - 1] = area;
             }

@@ -75,7 +75,7 @@ public:
       "debug_topic", "/perception/color_debug", startup_only);
     const auto points_topic =
       declare_parameter<std::string>("depth_points_topic", "", startup_only);
-    display_timeout_ = declare_parameter<double>("display_timeout", 0.15, startup_only);
+    display_timeout_ = declare_parameter<double>("display_timeout", 0.35, startup_only);
     if (!std::isfinite(display_timeout_) || display_timeout_ <= 0) {
       throw std::invalid_argument("display_timeout must be positive");
     }

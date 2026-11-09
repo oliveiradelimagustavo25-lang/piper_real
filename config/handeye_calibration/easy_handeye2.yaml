@@ -1,0 +1,14 @@
+# Native ROS node parameters. Reloaded on startup, without colcon build.
+/**:
+  ros__parameters:
+    name: piper_vidu
+    calibration_type: eye_in_hand
+    robot_base_frame: base_link
+    robot_effector_frame: link6
+    tracking_base_frame: camera_color_optical_frame
+    tracking_marker_frame: aruco_marker_9  # Change to the ONE fixed marker used throughout.
+    freehand_robot_movement: true         # Move using existing RViz/MoveIt, then sample.
+    calibration_algorithm: OpenCV/Tsai-Lenz
+    minimum_samples: 15
+    sampling_delay: 0.2                   # Both TFs sampled at now minus this many seconds.
+    max_tf_age: 0.5                       # Reject stopped/missing observation streams.
