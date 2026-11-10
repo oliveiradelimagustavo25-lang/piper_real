@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -81,6 +82,8 @@ class PickPlaceExecutor
   using NamedHandle = rclcpp_action::ServerGoalHandle<NamedAction>;
   using Motion = my_robot_commander::MotionController;
   using Scene = my_robot_commander::PickPlaceScene;
+  // Attached is a planning state, not a physical grasp-confirmation signal.
+  enum class GraspState {Empty, NeedsRecovery, Attached, Released};
 
 public:
   explicit PickPlaceExecutor(const rclcpp::Node::SharedPtr & node)
@@ -115,10 +118,13 @@ public:
     compression_ = parameter(node_, "gripper_compression", 0.002);
     max_age_ = parameter(node_, "max_target_age", 5.0);
     tf_timeout_ = parameter(node_, "tf_timeout", 0.3);
+    camera_frame_ = parameter<std::string>(node_, "required_camera_frame", "");
+    camera_tf_max_age_ = parameter(node_, "camera_tf_max_age", 1.0);
     if (!std::isfinite(open_width_) || !std::isfinite(pad_thickness_) ||
       !std::isfinite(compression_) || pad_thickness_ < 0 ||
       open_width_ <= 2 * pad_thickness_ || compression_ < 0 ||
-      approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0)
+      approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0 ||
+      !std::isfinite(camera_tf_max_age_) || camera_tf_max_age_ <= 0)
     {
       throw std::invalid_argument("Invalid gripper configuration or approach/lift/retreat distances");
     }
@@ -147,6 +153,9 @@ public:
       parameter<std::string>(node_, "objects_topic", "/perception/objects"), 10,
       [this](my_robot_interface::msg::DetectedObjectArray::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lock(observations_mutex_);
+        const int64_t stamp = static_cast<int64_t>(msg->header.stamp.sec) * 1000000000 +
+          msg->header.stamp.nanosec;
+        if (observations_after_ns_ != 0 && stamp <= observations_after_ns_) {return;}
         observations_ = msg;
       });
 
@@ -154,8 +163,8 @@ public:
     server_ = rclcpp_action::create_server<Action>(
       node_, name,
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const Action::Goal> goal) {
-        if (!validGoal(*goal) || holding_ || busy_.exchange(true)) {
-          RCLCPP_WARN(node_->get_logger(), "Rejected invalid/busy goal or object still held");
+        if (!validGoal(*goal) || grasp_state_ != GraspState::Empty || busy_.exchange(true)) {
+          RCLCPP_WARN(node_->get_logger(), "Rejected invalid/busy goal or pending grasp recovery");
           return rclcpp_action::GoalResponse::REJECT;
         }
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -175,7 +184,9 @@ public:
       node_,
       parameter<std::string>(node_, "move_to_named_action", "/manipulation/move_to_named"),
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const NamedAction::Goal> goal) {
-        if (goal->target.empty() || busy_.exchange(true)) {
+        if (goal->target.empty() || grasp_state_ == GraspState::NeedsRecovery ||
+          grasp_state_ == GraspState::Released || busy_.exchange(true))
+        {
           return rclcpp_action::GoalResponse::REJECT;
         }
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -197,14 +208,44 @@ public:
           return;
         }
         try {
-          if (!motion_->moveGripperToWidth(open_width_)) {
-            throw std::runtime_error("Opening gripper failed");
+          if (grasp_state_ != GraspState::Released) {
+            grasp_state_ = GraspState::NeedsRecovery;
+            if (!motion_->moveGripperToWidth(open_width_)) {
+              throw std::runtime_error("Opening gripper failed; explicit recovery still required");
+            }
+            grasp_state_ = GraspState::Released;
           }
           if (scene_->holding()) {scene_->release();}
-          holding_ = false;
           scene_->restoreTouch();
+          grasp_state_ = GraspState::Empty;
           response->success = true;
           response->message = "Gripper opened; planning-scene attachment released";
+        } catch (const std::exception & error) {
+          response->message = error.what();
+        }
+        busy_ = false;
+      }, rmw_qos_profile_services_default, recovery_group_);
+    clear_scene_service_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/manipulation/clear_observed_objects",
+      [this](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        if (busy_.exchange(true)) {
+          response->message = "Executor is busy";
+          return;
+        }
+        try {
+          if (grasp_state_ != GraspState::Empty) {
+            throw std::runtime_error("Grasp recovery is pending; objects cannot be cleared");
+          }
+          const auto count = scene_->clearObserved();
+          {
+            std::lock_guard<std::mutex> lock(observations_mutex_);
+            observations_.reset();
+            observations_after_ns_ = node_->now().nanoseconds();
+          }
+          response->success = true;
+          response->message = "Removed " + std::to_string(count) +
+            " managed objects; fixed environment retained; new observations may add objects again";
         } catch (const std::exception & error) {
           response->message = error.what();
         }
@@ -304,6 +345,16 @@ private:
         if (interrupted(handle)) {
           throw std::runtime_error("Canceled before " + name);
         }
+        if (!camera_frame_.empty()) {
+          const auto transform = tf_buffer_.lookupTransform(frame_, camera_frame_, tf2::TimePointZero);
+          const auto stamp = rclcpp::Time(
+            transform.header.stamp, node_->get_clock()->get_clock_type());
+          const double age = (node_->now() - stamp).seconds();
+          if (stamp.nanoseconds() == 0 || age < -0.1 || age > camera_tf_max_age_) {
+            throw std::runtime_error("Required camera TF is stale before " + name);
+          }
+        }
+        stage(feedback->stage, name);
         if (!operation()) {
           throw std::runtime_error(name + " failed");
         }
@@ -360,10 +411,13 @@ private:
       step("Descend to grasp", [&]() {return move(pick, true);});
       step(
         "Close gripper", [&]() {
-          // The MoveIt attachment is a planning model, not proof of a physical grasp.
+          // A failed/partial close can still contact an object. Never silently
+          // mark it empty or attach before the close command has completed.
+          grasp_state_ = GraspState::NeedsRecovery;
+          if (!grip(2 * pad_thickness_ + std::max(0.0, width - compression_))) {return false;}
           scene_->attach();
-          holding_ = true;
-          return grip(2 * pad_thickness_ + std::max(0.0, width - compression_));
+          grasp_state_ = GraspState::Attached;
+          return true;
         });
 
       stage(Action::Feedback::TRANSFERRING, "Lifting and transferring");
@@ -375,8 +429,8 @@ private:
       step(
         "Release object", [&]() {
           if (!grip(open_width_)) {return false;}
+          grasp_state_ = GraspState::Released;
           scene_->release();
-          holding_ = false;
           return true;
         });
       step("Retreat", [&]() {return move(put + tf2::Vector3(0, 0, retreat_), true);});
@@ -388,7 +442,12 @@ private:
     }
     try {
       scene_->restoreTouch();
+      if (grasp_state_ == GraspState::Released && !scene_->holding()) {
+        grasp_state_ = GraspState::Empty;
+      }
     } catch (const std::exception & error) {
+      // A completed release remains known even if collision cleanup must retry.
+      if (grasp_state_ != GraspState::Released) {grasp_state_ = GraspState::NeedsRecovery;}
       result->success = false;
       result->message += "; restoring collision checks failed: " + std::string(error.what());
     }
@@ -396,10 +455,14 @@ private:
       if (handle->is_canceling()) {
         result->success = false;
         result->message = "Canceled after current motion; gripper state retained";
+        if (grasp_state_ != GraspState::Empty) {result->message += "; explicit recovery required";}
         handle->canceled(result);
       } else if (result->success) {
         handle->succeed(result);
       } else {
+        if (grasp_state_ != GraspState::Empty) {
+          result->message += "; explicit grasp recovery required, no automatic release performed";
+        }
         handle->abort(result);
       }
     }
@@ -413,19 +476,21 @@ private:
   std::unique_ptr<Scene> scene_;
   std::mutex observations_mutex_;
   my_robot_interface::msg::DetectedObjectArray::ConstSharedPtr observations_;
+  int64_t observations_after_ns_ = 0;
   rclcpp::Subscription<my_robot_interface::msg::DetectedObjectArray>::SharedPtr objects_sub_;
   rclcpp::CallbackGroup::SharedPtr recovery_group_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr release_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_scene_service_;
   rclcpp_action::Server<Action>::SharedPtr server_;
   rclcpp_action::Server<NamedAction>::SharedPtr named_server_;
   std::thread worker_;
   std::atomic<bool> busy_{false};
-  std::atomic<bool> holding_{false};
-  std::string frame_;
+  std::atomic<GraspState> grasp_state_{GraspState::Empty};
+  std::string frame_, camera_frame_;
   tf2::Vector3 tool_to_tcp_, offset_;
   tf2::Quaternion tool_rotation_;
   double approach_, lift_, transport_z_, clearance_, retreat_;
-  double open_width_, pad_thickness_, compression_, max_age_, tf_timeout_;
+  double open_width_, pad_thickness_, compression_, max_age_, tf_timeout_, camera_tf_max_age_;
 };
 
 int main(int argc, char ** argv)

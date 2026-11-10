@@ -35,10 +35,13 @@ class TaskPlanner : public rclcpp::Node
   enum class Phase {WAITING, SENDING, EXECUTING, OBSERVING};
 
 public:
-  TaskPlanner() : Node("task_planner"), tf_buffer_(get_clock()), tf_listener_(tf_buffer_)
+  TaskPlanner() : Node("task_planner"), tf_buffer_(get_clock())
   {
     frame_ = declare_parameter<std::string>("reference_frame", "base_link");
     tool_frame_ = declare_parameter<std::string>("end_effector_frame", "link6");
+    camera_frame_ = declare_parameter<std::string>("required_camera_frame", "");
+    camera_tf_max_age_ = declare_parameter<double>("camera_tf_max_age", 1.0);
+    one_per_color_ = declare_parameter<bool>("one_object_per_color", false);
     tool_to_tcp_ = xyz(declare_parameter<std::vector<double>>("tool_to_tcp", {0, 0, 0.132}));
     default_strategy_ = declare_parameter<std::string>("default_strategy", "color_order");
     const auto order = declare_parameter<std::vector<int64_t>>("default_color_order", {1, 2, 3});
@@ -50,8 +53,17 @@ public:
     }
     max_age_ = declare_parameter<double>("max_observation_age", 2.0);
     timeout_ = declare_parameter<double>("observation_timeout", 5.0);
-    observation_target_ = declare_parameter<std::string>("observation_target", "pose_1");
+    observation_target_ = declare_parameter<std::string>("observation_target", "");
     settle_time_ = declare_parameter<double>("observation_settle_time", 0.3);
+    const auto place_modes = declare_parameter<std::vector<std::string>>(
+      "place_position_modes", {"absolute", "absolute", "absolute"});
+    if (place_modes.size() != 3 || !std::all_of(place_modes.begin(), place_modes.end(),
+      [](const auto & mode) {return mode == "absolute" || mode == "relative";}))
+    {
+      throw std::invalid_argument("place_position_modes needs absolute/relative for each of x/y/z");
+    }
+    std::transform(place_modes.begin(), place_modes.end(), place_relative_axes_.begin(),
+      [](const auto & mode) {return mode == "relative";});
     places_[1] = xyz(declare_parameter<std::vector<double>>(
         "red.place_position", {0.26, -0.04, 0.005}));
     places_[2] = xyz(declare_parameter<std::vector<double>>(
@@ -60,7 +72,8 @@ public:
         "blue.place_position", {0.26, 0.04, 0.005}));
     if (!validPolicy(default_strategy_, default_order_) || frame_.empty() || tool_frame_.empty() ||
       !std::isfinite(max_age_) || max_age_ <= 0 || !std::isfinite(timeout_) || timeout_ <= 0 ||
-      !std::isfinite(settle_time_) || settle_time_ < 0)
+      !std::isfinite(settle_time_) || settle_time_ < 0 ||
+      !std::isfinite(camera_tf_max_age_) || camera_tf_max_age_ <= 0)
     {
       throw std::invalid_argument("Invalid task policy, frames or observation timeouts");
     }
@@ -96,14 +109,20 @@ public:
         batch_ready_ = false;
         completed_ = 0;
         phase_ = Phase::WAITING;
-        needs_observation_ = !observation_target_.empty();
-        observations_after_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+        // A new batch starts at the current pose. A named observation pose is
+        // an optional between-object policy, never an Action precondition.
+        needs_observation_ = false;
+        observations_after_ = now() + rclcpp::Duration::from_seconds(settle_time_);
+        observations_.reset();
         waiting_since_ = std::chrono::steady_clock::now();
         waiting_reason_.clear();
         feedback("");
       });
     // 所有任务状态都在同一个 executor 中更新；Action 等待使用异步回调。
     timer_ = create_wall_timer(100ms, [this]() { tick(); });
+    // Start the TF thread only after configuration/setup succeeds; constructor errors
+    // must not wait for a listener thread while the ROS context is still active.
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(tf_buffer_);
     RCLCPP_INFO(get_logger(), "Task planner ready; waiting for SortObjects goals");
   }
 
@@ -276,7 +295,20 @@ private:
     goal.object_pose.pose = object.pose;
     goal.object_dimensions = object.dimensions;
     goal.place_pose.header.frame_id = frame_;
-    const auto & place = places_[object.color];
+    // Resolve once from this object's observed centre, along reference_frame axes.
+    // Copy the configured values so relative offsets never accumulate across tasks.
+    auto place = places_[object.color];
+    const tf2::Vector3 origin(object.pose.position.x, object.pose.position.y, object.pose.position.z);
+    for (int axis = 0; axis < 3; ++axis) {
+      if (place_relative_axes_[axis]) {place[axis] += origin[axis];}
+    }
+    if (!std::isfinite(place.x()) || !std::isfinite(place.y()) || !std::isfinite(place.z())) {
+      throw std::invalid_argument("Resolved place position is not finite");
+    }
+    RCLCPP_INFO(
+      get_logger(), "%s in %s: object [%.3f, %.3f, %.3f] -> place [%.3f, %.3f, %.3f] m",
+      object.object_id.c_str(), frame_.c_str(), origin.x(), origin.y(), origin.z(),
+      place.x(), place.y(), place.z());
     goal.place_pose.pose.position.x = place.x();
     goal.place_pose.pose.position.y = place.y();
     goal.place_pose.pose.position.z = place.z();
@@ -337,6 +369,14 @@ private:
     }
     if (phase_ != Phase::WAITING) { return; }
     try {
+      if (!camera_frame_.empty()) {
+        const auto transform = tf_buffer_.lookupTransform(frame_, camera_frame_, tf2::TimePointZero);
+        const auto stamp = rclcpp::Time(transform.header.stamp, get_clock()->get_clock_type());
+        const double age = (now() - stamp).seconds();
+        if (stamp.nanoseconds() == 0 || age < -0.1 || age > camera_tf_max_age_) {
+          throw std::runtime_error("Required camera TF is stale");
+        }
+      }
       if (needs_observation_) {
         if (!named_client_->action_server_is_ready()) {
           waiting("Waiting for observation motion server");
@@ -374,9 +414,12 @@ private:
           }
         }
         // 固定本批 ID，防止已放置物体被重新识别后再次进入任务。
-        for (const auto & object : objects) {
-          if (std::find(order_.begin(), order_.end(), object.color) != order_.end()) {
-            pending_[object.object_id] = object.color;
+        for (const auto color : order_) {
+          for (const auto & object : objects) {
+            if (object.color == color) {
+              pending_[object.object_id] = color;
+              if (one_per_color_) {break;}
+            }
           }
         }
         batch_ready_ = true;
@@ -412,7 +455,7 @@ private:
   }
 
   tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Subscription<Objects>::SharedPtr subscription_;
   rclcpp_action::Server<Sort>::SharedPtr server_;
   rclcpp_action::Client<Pick>::SharedPtr pick_client_;
@@ -425,15 +468,16 @@ private:
   PickHandle::SharedPtr active_pick_;
   NamedHandle::SharedPtr active_named_;
   std::string observation_target_;
-  std::string frame_, tool_frame_, default_strategy_, strategy_, waiting_reason_;
+  std::string frame_, tool_frame_, camera_frame_, default_strategy_, strategy_, waiting_reason_;
   tf2::Vector3 tool_to_tcp_;
   std::array<tf2::Vector3, 4> places_;
+  std::array<bool, 3> place_relative_axes_{};
   std::vector<uint8_t> default_order_, order_;
   std::map<std::string, uint8_t> pending_;
-  double max_age_, timeout_, settle_time_;
+  double max_age_, timeout_, settle_time_, camera_tf_max_age_;
   uint32_t completed_ = 0;
   bool busy_ = false, batch_ready_ = false, cancel_sent_ = false;
-  bool needs_observation_ = false;
+  bool needs_observation_ = false, one_per_color_ = false;
   Phase phase_ = Phase::WAITING;
   std::chrono::steady_clock::time_point waiting_since_;
 };

@@ -46,7 +46,7 @@ target_link_libraries(depth_localizer ${OpenCV_LIBS})
 
 install(TARGETS color_detector aruco_detector depth_localizer
   DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)

@@ -4,8 +4,10 @@ task_planner:
     action_name: /sorting/sort_objects
     pick_place_action: /manipulation/pick_place
     move_to_named_action: /manipulation/move_to_named
-    observation_target: pose_1      # SRDF arm 命名姿态；固定外部相机可设为 ""
-    observation_settle_time: 0.3    # s，到位后等待新图像；每个物块抓取前返回观察位
+    # 接收分拣 Action 后直接使用当前位置的新观测，不要求先到固定姿态。
+    # 此姿态只用于同一批次中相邻物料之间的回位观察；设为 "" 可关闭。
+    observation_target: ""        # 独立 Planner 默认不回固定姿态；脚本可按任务配置。
+    observation_settle_time: 0.3    # s，新任务或回位后等待新图像的稳定时间。
     reference_frame: base_link
     end_effector_frame: link6
     tool_to_tcp: [0.0, 0.0, 0.132]   # 与 manipulation.yaml 的 TCP 标定一致
@@ -15,7 +17,16 @@ task_planner:
     max_observation_age: 2.0         # s，拒绝过期观测
     observation_timeout: 5.0         # s，等待目标/TF/执行服务的最长时间
 
-    # 物体中心的放置位置，使用 reference_frame，m；当前为 1 cm 地面物块。
+    # 放置参数按 [x, y, z] 排列，单位 m，三种颜色共用下面的逐轴模式。
+    # absolute：参数就是 reference_frame 下的绝对物体中心坐标。
+    # relative：参数是相对本次抓取前物体中心的偏移，方向仍沿 reference_frame 的轴。
+    # 例如 [relative, absolute, absolute] 配合 [-0.24, -0.06, -0.12]：
+    #   目标 = [物体初始 x - 0.24, -0.06, -0.12]；不跟随物体自身旋转。
+    # 不设置模式时默认全 absolute，保留原来的绝对坐标含义。
+    place_position_modes: [absolute, absolute, absolute]
+
+    # 以下数值保留原 1 cm 仿真物块的绝对放置点；实物场景须按支撑面和物高填写。
+    # 三物料 .sh 启动时，这些数值和标志均由其 startup.yaml 覆盖，原文件不修改。
     red.place_position: [0.26, -0.06, 0.005]
     green.place_position: [0.26, 0.0, 0.005]
     blue.place_position: [0.26, 0.06, 0.005]

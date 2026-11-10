@@ -3,6 +3,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,8 @@ public:
   void attach();
   void release();
   void restoreTouch();
+  // Explicitly confirmed removal, never inferred from an empty/occluded camera frame.
+  std::size_t clearObserved();
   bool holding() const {return !held_id_.empty();}
 
 private:
@@ -51,6 +54,7 @@ private:
   std::vector<std::string> touch_links_;
   std::map<std::string, int> previous_touch_;
   moveit_msgs::msg::CollisionObject target_;
+  std::set<std::string> observed_ids_;
   moveit::planning_interface::PlanningSceneInterface scene_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_;
 };

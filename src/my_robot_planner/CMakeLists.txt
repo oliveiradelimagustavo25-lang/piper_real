@@ -16,5 +16,5 @@ target_compile_options(task_planner PRIVATE -Wall -Wextra -Wpedantic)
 ament_target_dependencies(task_planner
   rclcpp rclcpp_action my_robot_interface geometry_msgs tf2 tf2_ros tf2_geometry_msgs)
 install(TARGETS task_planner DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 ament_package()

@@ -269,22 +269,53 @@ private:
     return mapped;
   }
 
+  bool heightBand(std::vector<float> & heights, float & low, float & high) const
+  {
+    std::sort(heights.begin(), heights.end());
+    size_t best_begin = 0, best_end = 0, end = 0;
+    for (size_t begin = 0; begin < heights.size(); ++begin) {
+      while (end < heights.size() && heights[end] - heights[begin] <= 2 * top_tolerance_) {++end;}
+      if (end - begin > best_end - best_begin) {best_begin = begin; best_end = end;}
+    }
+    if (best_end - best_begin < static_cast<size_t>(min_pixels_) ||
+      best_end - best_begin < heights.size() / 4) {return false;}
+    low = heights[best_begin]; high = heights[best_end - 1];
+    return true;
+  }
+
   // Require a measured foreground boundary on at least one adequately sampled
   // side. A continuous background or missing surround is not evidence for an
   // object's depth. The RGB region remains valid independently of this check.
   bool filter_object_surface(
     const cv::Mat & mapped, const cv::Mat & labels,
-    const cv::Rect & box, std::vector<cv::Point3f> & points) const
+    const cv::Rect & box, std::vector<cv::Point3f> & points,
+    const tf2::Transform * camera_to_objects) const
   {
     if (points.size() < 3) {return false;}
-    const cv::Mat samples(static_cast<int>(points.size()), 3, CV_32F,
-      const_cast<cv::Point3f *>(points.data()));
+    auto plane_points = points;
+    // With a known Z-up frame, seed the plane from the horizontal height mode.
+    // Otherwise a narrow strip beside a depth hole can make PCA select a side plane.
+    if (camera_to_objects) {
+      std::vector<float> heights;
+      for (const auto & p : points) {
+        heights.push_back(((*camera_to_objects) * tf2::Vector3(p.x, p.y, p.z)).z());
+      }
+      auto sorted = heights;
+      float low, high;
+      if (heightBand(sorted, low, high)) {
+        plane_points.clear();
+        for (size_t i = 0; i < points.size(); ++i) {
+          if (heights[i] >= low - 1e-6 && heights[i] <= high + 1e-6) {plane_points.push_back(points[i]);}
+        }
+      }
+    }
+    const cv::Mat samples(static_cast<int>(plane_points.size()), 3, CV_32F, plane_points.data());
     cv::PCA plane(samples, cv::Mat(), cv::PCA::DATA_AS_ROW);
     if (plane.eigenvalues.at<float>(1) <= 1e-12f) {return false;}
     // Trim boundary outliers before estimating plane noise. A small amount of
     // background must not inflate the tolerance enough to erase a 1cm step.
     std::vector<float> residuals;
-    for (const auto & point : points) {
+    for (const auto & point : plane_points) {
       residuals.push_back(
         std::abs(
           plane.eigenvectors.at<float>(2, 0) * (point.x - plane.mean.at<float>(0, 0)) +
@@ -293,8 +324,12 @@ private:
     }
     const auto cutoff = std::max(surface_separation_ / 2, 3.0 * median(residuals));
     std::vector<cv::Point3f> support;
-    for (size_t i = 0; i < points.size(); ++i) {
-      if (residuals[i] <= cutoff) {support.push_back(points[i]);}
+    for (const auto & point : points) {
+      const cv::Vec3f delta(point.x - plane.mean.at<float>(0, 0),
+        point.y - plane.mean.at<float>(0, 1), point.z - plane.mean.at<float>(0, 2));
+      const cv::Vec3f normal(plane.eigenvectors.at<float>(2, 0),
+        plane.eigenvectors.at<float>(2, 1), plane.eigenvectors.at<float>(2, 2));
+      if (std::abs(normal.dot(delta)) <= cutoff) {support.push_back(point);}
     }
     if (support.size() < static_cast<size_t>(std::max(3, min_pixels_))) {return false;}
     points = std::move(support);
@@ -374,26 +409,21 @@ private:
     const sensor_msgs::msg::CameraInfo & camera, const tf2::Transform & camera_to_objects,
     geometry_msgs::msg::Point & center) const
   {
+    const auto reject = [&](const char * reason) {
+        RCLCPP_DEBUG(get_logger(), "Object centre rejected: %s", reason);
+        return false;
+      };
     std::vector<float> heights;
     for (const auto & point : surface) {heights.push_back(point.z());}
-    std::sort(heights.begin(), heights.end());
-    size_t best_begin = 0, best_end = 0, end = 0;
-    for (size_t begin = 0; begin < heights.size(); ++begin) {
-      while (end < heights.size() && heights[end] - heights[begin] <= 2 * top_tolerance_) {
-        ++end;
-      }
-      if (end - begin > best_end - best_begin) {best_begin = begin; best_end = end;}
-    }
-    // A visible top face forms a height mode. A vertical side alone does not.
-    if (best_end - best_begin < static_cast<size_t>(min_pixels_) ||
-      best_end - best_begin < surface.size() / 4) {return false;}
+    float low, high;
+    if (!heightBand(heights, low, high)) {return reject("insufficient top height support");}
     std::vector<cv::Point3f> band;
     for (const auto & point : surface) {
-      if (point.z() >= heights[best_begin] - 1e-6 && point.z() <= heights[best_end - 1] + 1e-6) {
+      if (point.z() >= low - 1e-6 && point.z() <= high + 1e-6) {
         band.emplace_back(point.x(), point.y(), point.z());
       }
     }
-    if (band.size() < static_cast<size_t>(min_pixels_)) {return false;}
+    if (band.size() < static_cast<size_t>(min_pixels_)) {return reject("top band too small");}
     const auto fit = [](const std::vector<cv::Point3f> & points) {
         return cv::PCA(
           cv::Mat(
@@ -401,7 +431,7 @@ private:
             const_cast<cv::Point3f *>(points.data())), cv::Mat(), cv::PCA::DATA_AS_ROW);
       };
     auto plane = fit(band);
-    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return false;}
+    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return reject("top band not horizontal");}
     const cv::Vec3f normal(plane.eigenvectors.at<float>(2, 0),
       plane.eigenvectors.at<float>(2, 1), plane.eigenvectors.at<float>(2, 2));
     const cv::Vec3f origin(plane.mean.at<float>(0, 0), plane.mean.at<float>(0, 1),
@@ -418,9 +448,9 @@ private:
         top.emplace_back(p);
       }
     }
-    if (top.size() < static_cast<size_t>(min_pixels_)) {return false;}
+    if (top.size() < static_cast<size_t>(min_pixels_)) {return reject("too few top inliers");}
     plane = fit(top);
-    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return false;}
+    if (std::abs(plane.eigenvectors.at<float>(2, 2)) < 0.9) {return reject("refined top not horizontal");}
     // RGB determines lateral position; depth holes must not move the object centre.
     const cv::Mat k(3, 3, CV_64F, const_cast<double *>(camera.k.data()));
     std::vector<cv::Point2d> rays;
@@ -440,8 +470,61 @@ private:
     const double distance = n.dot(mean - camera_to_objects.getOrigin()) / denominator;
     if (!std::isfinite(distance) || distance <= 0) {return false;}
     const auto position = camera_to_objects.getOrigin() + distance * direction;
-    center.x = position.x(); center.y = position.y();
-    center.z = position.z() - dimensions_.z / 2;
+    // The colour bbox includes visible sides. At an oblique view its centre is
+    // not the top-face centre. Fit the known axis-aligned box silhouette to the
+    // RGB bbox centre; the depth plane supplies height, not a sparse-point centroid.
+    const auto camera_from_objects = camera_to_objects.inverse();
+    const auto box_center = [&](double x, double y) {
+        const double top_z = (n.dot(mean) - n.x() * x - n.y() * y) / n.z();
+        return tf2::Vector3(x, y, top_z - dimensions_.z / 2);
+      };
+    const auto project_box = [&](const tf2::Vector3 & candidate, cv::Point2d & output) {
+        std::vector<cv::Point3d> corners;
+        for (double x : {-0.5, 0.5}) {
+          for (double y : {-0.5, 0.5}) {
+            for (double z : {-0.5, 0.5}) {
+              const auto p = camera_from_objects * (candidate + tf2::Vector3(
+                x * dimensions_.x, y * dimensions_.y, z * dimensions_.z));
+              if (!std::isfinite(p.z()) || p.z() <= 0) {return false;}
+              corners.emplace_back(p.x(), p.y(), p.z());
+            }
+          }
+        }
+        std::vector<cv::Point2d> projected;
+        if (camera.distortion_model == "equidistant") {
+          cv::fisheye::projectPoints(corners, projected, cv::Vec3d(), cv::Vec3d(), k, cv::Mat(camera.d));
+        } else {
+          cv::projectPoints(corners, cv::Vec3d(), cv::Vec3d(), k, cv::Mat(camera.d), projected);
+        }
+        double left = projected[0].x, right = left, top = projected[0].y, bottom = top;
+        for (const auto & p : projected) {
+          if (!std::isfinite(p.x) || !std::isfinite(p.y)) {return false;}
+          left = std::min(left, p.x); right = std::max(right, p.x);
+          top = std::min(top, p.y); bottom = std::max(bottom, p.y);
+        }
+        output = {(left + right) / 2, (top + bottom) / 2};
+        return true;
+      };
+    auto candidate = box_center(position.x(), position.y());
+    constexpr double delta = 1e-4;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+      cv::Point2d projected, dx, dy;
+      if (!project_box(candidate, projected)) {return reject("invalid box projection");}
+      const auto error = pixel - projected;
+      if (cv::norm(error) < 0.05) {break;}
+      if (!project_box(box_center(candidate.x() + delta, candidate.y()), dx) ||
+        !project_box(box_center(candidate.x(), candidate.y() + delta), dy)) {return reject("invalid projection derivative");}
+      dx = (dx - projected) / delta; dy = (dy - projected) / delta;
+      const cv::Matx22d jacobian(dx.x, dy.x, dx.y, dy.y);
+      if (std::abs(cv::determinant(jacobian)) < 1e-8) {return reject("singular projection derivative");}
+      const auto step = jacobian.inv() * cv::Vec2d(error.x, error.y);
+      if (!std::isfinite(step[0]) || !std::isfinite(step[1]) ||
+        cv::norm(step) > std::hypot(dimensions_.x, dimensions_.y, dimensions_.z)) {return reject("invalid silhouette fit step");}
+      candidate = box_center(candidate.x() + step[0], candidate.y() + step[1]);
+    }
+    cv::Point2d projected;
+    if (!project_box(candidate, projected) || cv::norm(pixel - projected) > 0.5) {return reject("silhouette fit did not converge");}
+    center.x = candidate.x(); center.y = candidate.y(); center.z = candidate.z();
     return std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(center.z);
   }
 
@@ -526,7 +609,8 @@ private:
             if (end - start >= static_cast<size_t>(min_pixels_)) {
               std::vector<cv::Point3f> layer(valid_points.begin() + start,
                 valid_points.begin() + end);
-              if (filter_object_surface(mapped, labels->image, box, layer) &&
+              if (filter_object_surface(mapped, labels->image, box, layer,
+                objects_tf_ready ? &camera_to_objects : nullptr) &&
                 layer.size() > inlier_points.size())
               {
                 inlier_points = std::move(layer);

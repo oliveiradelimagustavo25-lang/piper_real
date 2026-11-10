@@ -21,7 +21,7 @@ def make_nodes(context):
         'name': 'piper_vidu', 'calibration_type': 'eye_in_hand',
         'robot_base_frame': 'base_link', 'robot_effector_frame': 'link6',
         'tracking_base_frame': 'camera_color_optical_frame',
-        'tracking_marker_frame': 'aruco_marker_7',
+        'tracking_marker_frame': 'aruco_marker_9',
     }]
     if value('handeye_config'):
         config = Path(value('handeye_config')).expanduser().resolve()

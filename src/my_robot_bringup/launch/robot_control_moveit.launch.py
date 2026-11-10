@@ -35,9 +35,9 @@ def make_nodes(context):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('control_mode', default_value='mock', choices=['mock', 'real']),
+        DeclareLaunchArgument('control_mode', default_value='real', choices=['mock', 'real']),
         DeclareLaunchArgument('can_port', default_value='can0'),
-        DeclareLaunchArgument('auto_enable', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('auto_enable', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('use_rviz', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('tcp_offset', default_value='[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]'),
         DeclareLaunchArgument('use_sim_time', default_value='false', choices=['true', 'false']),

@@ -39,6 +39,8 @@ depth_localizer:
     target_frame: ""             # 空字符串：相机光学系；可改为 base_link
     objects_topic: /perception/objects
     objects_frame: base_link     # Z 轴向上的坐标系，物体中心位姿使用此坐标系
+    # 中心模型适用于已知尺寸、平放且轴与 objects_frame 对齐的单色箱体。
+    # 深度估计顶面，RGB 箱体轮廓补偿斜视侧面；不是任意遮挡物体的 6D 位姿估计。
     object_dimensions: [0.05, 0.05, 0.05]  # 当前实物方块 50 mm；更换物体时同步修改
     top_surface_tolerance: 0.002 # 上部点的高度容差，m；要求物块平放且顶部可见
     tf_timeout: 0.1              # s，等待采集时刻的 TF 到达，避免图像略早于关节 TF

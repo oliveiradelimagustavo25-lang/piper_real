@@ -53,6 +53,13 @@ moveit_msgs::msg::PlanningScene diff()
   result.robot_state.is_diff = true;
   return result;
 }
+
+void validateObjectId(const std::string & id)
+{
+  if (id.empty() || id.rfind("environment/", 0) == 0) {
+    throw std::invalid_argument("Perceived/target object ID is empty or uses reserved environment/ prefix");
+  }
+}
 }  // namespace
 
 PickPlaceScene::PickPlaceScene(
@@ -120,7 +127,9 @@ void PickPlaceScene::sync(
   const double age = (node_->now() - stamp).seconds();
   if (stamp.nanoseconds() != 0 && (age < -0.1 || age > 2.0)) {return;}
   auto update = diff();
+  std::set<std::string> observed;
   for (const auto & object : observations->objects) {
+    validateObjectId(object.object_id);
     if (object.object_id == held_id_) {continue;}
     geometry_msgs::msg::PoseStamped pose;
     pose.header = observations->header;
@@ -132,14 +141,19 @@ void PickPlaceScene::sync(
       box(
         object.object_id, pose,
         {object.dimensions.x, object.dimensions.y, object.dimensions.z}));
+    observed.insert(object.object_id);
   }
-  if (!update.world.collision_objects.empty()) {apply(update);}
+  if (!update.world.collision_objects.empty()) {
+    apply(update);
+    observed_ids_.insert(observed.begin(), observed.end());
+  }
 }
 
 void PickPlaceScene::prepare(
   const std::string & id,
   const geometry_msgs::msg::PoseStamped & pose, const geometry_msgs::msg::Vector3 & dimensions)
 {
+  validateObjectId(id);
   target_id_ = id;
   target_ = box(id, pose, {dimensions.x, dimensions.y, dimensions.z});
   auto update = diff();
@@ -154,6 +168,7 @@ void PickPlaceScene::prepare(
   }
   matrix.getMessage(update.allowed_collision_matrix);
   apply(update);
+  observed_ids_.insert(id);
 }
 
 void PickPlaceScene::attach()
@@ -210,6 +225,25 @@ void PickPlaceScene::restoreTouch()
   matrix.getMessage(update.allowed_collision_matrix);
   apply(update);
   previous_touch_.clear();
+}
+
+std::size_t PickPlaceScene::clearObserved()
+{
+  if (holding() || !previous_touch_.empty()) {
+    throw std::runtime_error("Cannot clear objects while a grasp or collision recovery is pending");
+  }
+  auto update = diff();
+  for (const auto & id : observed_ids_) {
+    moveit_msgs::msg::CollisionObject object;
+    object.id = id;
+    object.header.frame_id = frame_;
+    object.operation = object.REMOVE;
+    update.world.collision_objects.push_back(object);
+  }
+  if (!observed_ids_.empty()) {apply(update);}
+  const auto count = observed_ids_.size();
+  observed_ids_.clear();
+  return count;
 }
 
 }  // namespace my_robot_commander

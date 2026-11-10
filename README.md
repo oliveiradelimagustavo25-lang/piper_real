@@ -4,18 +4,20 @@
 
 当前阶段主要完成相机与视觉基础链路。机器人控制、规划与执行模块已经分包，但完整实机抓取、手眼标定和精度验收尚未完成。
 
+各测试文件、七个 `.sh` 和五个正式 launch 的用途、默认参数、配置来源、命令示例与结果判定，见 [可执行入口使用手册](docs/entrypoints_reference.md)。
+
 ## 目录与职责
 
 | 目录 | 职责 |
 | --- | --- |
 | `src/agx_ros_control_moveit/` | AGX 机械臂驱动、机器人描述、MoveIt、控制器及 RViz 配置 |
 | `src/vidu_camera_wrapper/` | Vidu ROS 2 消息接口与相机采集节点，依赖外部 Vidu SDK |
-| `src/my_robot_perception/` | 原始 RGB 颜色分割、深度关联、ArUco 检测和视觉测试入口 |
+| `src/my_robot_perception/` | 原始 RGB 颜色分割、深度关联和 ArUco 检测节点 |
 | `src/my_robot_interface/` | 上层模块共用的消息与 Action 定义 |
 | `src/my_robot_commander/` | MoveIt 运动封装、抓放执行器和碰撞场景管理 |
 | `src/my_robot_planner/` | 根据感知对象组织分拣任务，调用执行层 Action |
 | `src/my_robot_bringup/` | 三个独立分层入口与总入口：控制、运动/行为规划、相机感知 |
-| `test/` | 集中 Python 测试入口，`native/` 保留实际 C++ 转换验证源，`upstream/` 保留驱动原有规范检查 |
+| `test/` | 五个按职责划分的 Python 测试入口，`native/` 保留实际 C++ 转换验证源 |
 | `docs/` | 方案、集成缺口、实施说明和调试记录 |
 
 主要视觉数据流：
@@ -132,7 +134,7 @@ ros2 launch my_robot_bringup robot.launch.py --show-args
 | `can_port`、`auto_enable`、`tcp_offset`、`use_rviz` | 底层驱动、TCP 模型和显示配置 |
 | `start_executor`、`start_planner` | 中层分别启用现有抓放执行器、任务规划器；替换组件时可独立关闭 |
 | `manipulation_config`、`planner_config` | 抓放与任务配置 YAML，名称分开以免冲突 |
-| `perception_mode`、`perception_config` | 上层检测模式与 YAML；内部复用视觉模块的 `mode/config` |
+| `perception_mode`、`perception_config` | 上层检测模式与 YAML，由视觉入口直接装配节点 |
 | `start_camera`、`enable_depth`、`show_window` | 上层采集、深度关联与窗口配置 |
 | `use_sim_time` | 三层共享，默认 `false`；mock 模式本身不产生 `/clock` |
 
@@ -152,6 +154,10 @@ motion.closeGripper();                          // 官方 gripper_close，0 mm
 
 接口长度为 m、角度为 rad；输入或规划/执行被拒时返回 false，配置及 ROS/MoveIt 异常可向调用者抛出。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示 MoveIt 报告轨迹成功，不表示已确认真机到位或夹住物体。当前库不提供运动中取消，执行器 Action 在当前基本动作结束后取消后续步骤。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。更换行为规划节点可复用这些 Action；更换轨迹规划算法由底层 MoveIt pipeline 配置负责。
 
+抓放执行器在闭合命令成功后才附着模型；闭合不确定、附着失败或搬运失败时，不自动开爪或假定空手。`/manipulation/release_held_object` 是显式恢复接口，可能真实开爪，须先确认承托和现场状态。状态不确定时拒绝新抓取与命名运动；已附着的对象在运动失败后仍保留碰撞模型。
+
+视觉缺失可能是遮挡或相机移开，不能据此删除障碍。确认已移走本执行器管理的物体后，可调用 `/manipulation/clear_observed_objects`（std_srvs/Trigger）删除相应世界碰撞体；忙碌、待恢复或仍附着时拒绝。固定 `environment/` 环境不会删除；清理前旧帧不会重新回灌，新有效观测仍可加入物体。该接口只改规划场景，不移动机器人或开爪。
+
 相机挂载 TF 留待手眼标定，未迁入参考项目的错误外参；缺机器人 TF 时，相机二维检测和相机系测量仍可独立工作，`base_link` 物体输出尚不完整。`tcp_offset` 默认零，执行器 `tool_to_tcp` 仍需实际核对。启动层不再管理 Octomap 开关；当前没有启用相机障碍输入，固定碰撞环境由中层管理。
 
 当前真机路径仍沿用 AGX 的 mock 控制器到 SDK 的命令桥接，未将硬件反馈写入 ros2_control state interface；控制器成功不能证明真机到位。本机 MoveIt 2.5.10 的退出阶段 `move_group` 段错误尚未修复，本次分层重构不代表真机闭环或正常退出已验收。记录见 [分层构建报告](docs/real_grasp_integration_gaps.md#9-三层启动与接口边界2026-11-08)。
@@ -161,11 +167,11 @@ motion.closeGripper();                          // 官方 gripper_close，0 mm
 连接相机后，在已 source 工作区的终端运行：
 
 ```bash
-ros2 launch my_robot_perception perception_test.launch.py \
-  start_camera:=true mode:=color show_window:=true
+ros2 launch my_robot_bringup robot_perception.launch.py \
+  perception_mode:=color show_window:=true
 ```
 
-| `mode` | 启动内容 | `show_window:=true` 时的窗口 |
+| `perception_mode` | 启动内容 | `show_window:=true` 时的窗口 |
 | --- | --- | --- |
 | `color`（默认） | 颜色检测，默认同时启动深度定位 | Color detector |
 | `aruco` | ArUco 检测 | ArUco |
@@ -174,21 +180,24 @@ ros2 launch my_robot_perception perception_test.launch.py \
 
 其他参数：
 
-- `start_camera`：默认 `false`。已有相机节点或播放录包时保持 false；设为 true 才打开实物相机。
-- `show_window`：默认 `true`；false 关闭全部窗口。`mode:=none show_window:=false` 不启动视觉节点，相机驱动是否启动仍由 `start_camera` 决定。
+- `start_camera`：默认 `true`。已有相机节点或播放录包时设为 false，避免重复打开设备。
+- `show_window`：默认 `true`；false 关闭全部窗口。`perception_mode:=none show_window:=false` 不启动检测/预览节点，相机驱动是否启动仍由 `start_camera` 决定。
 - `enable_depth`：默认 `true`，只影响 color/both 模式；false 保留纯 RGB 检测，不等待深度标注。
-- `config`：默认使用已安装的 `perception.yaml`。修改源码配置后可重建，或直接传入其绝对路径。
+- `perception_config`：默认使用已安装的 `perception.yaml`。修改源码配置后可重建，或直接传入其绝对路径。
+- `publish_handeye_tf`：默认 `false`；开启后发布已保存的手眼标定。二维显示、颜色检测和相机系 ArUco 位姿不要求手眼 TF；输出基座系物体位置需要完整 TF。该开关不代表 launch 会等待 TF 后才启动视觉节点。
 - `use_sim_time`：默认 `false`；播放带 `/clock` 的录包时按需设置。
 
 直接使用工作区源码配置的示例：
 
 ```bash
-ros2 launch my_robot_perception perception_test.launch.py \
-  start_camera:=true mode:=aruco show_window:=true \
-  config:="$(pwd)/src/my_robot_perception/config/perception.yaml"
+ros2 launch my_robot_bringup robot_perception.launch.py \
+  perception_mode:=aruco show_window:=true \
+  perception_config:="$(pwd)/src/my_robot_perception/config/perception.yaml"
 ```
 
 视觉节点的显式配置参数为启动时只读，修改 YAML 后重新启动。当前 ArUco 配置为 `DICT_4X4_50`、`marker_size: 0.03` 米；边长指单个黑色码的外边长，含黑框、不含白边。更换标定板时必须同步确认这两项。
+
+当前物体中心模型面向已知尺寸、平放且轴与 base_link 对齐的单色箱体：深度提供顶面平面，RGB 与已知箱体投影补偿斜视时可见侧面对 bbox 中心的影响。它保留 RGB 独立分割，不用稀疏深度质心替代横向定位；尚不支持任意遮挡与任意物体姿态的精度保证。
 
 ## 关键输出与显示
 
@@ -224,11 +233,10 @@ colcon test-result --verbose
 
 ```bash
 ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
-  python3 -m pytest -q test/test_robot_configuration.py test/test_robot_launch.py \
-  test/test_visual_pipeline.py test/test_conversions.py
+  /usr/bin/python3 -m pytest -q test/
 ```
 
-配置检查不启动节点；启动集成测试强制使用隔离域 175、mock 控制器、无相机、无窗口，验证分层独立性、依赖等待、命名姿态和 40 mm 总开口。视觉合成回归不打开真实相机。`test/native/test_conversions.cpp` 仅作为 Python 调用的原生验证程序源，保留对真实 C++ SDK 转换的 8 项检查；没有在 Python 里复制转换算法。`test/upstream/` 是迁移后的驱动原有 lint 检查，可用 `python3 -m pytest -q test/upstream` 单独运行；当前仍有原驱动的格式/文档字符串报错，不属于上述功能测试命令。
+配置检查不启动节点；模拟联动使用隔离域和 mock 控制器，验证分层独立性、依赖等待、命名姿态和 40 mm 总开口。视觉与手眼回归使用合成数据，不连接硬件。测试目录保留五个按职责划分的 Python 入口；三物料前置检查已并入配置测试，重复的视觉模式检查与上游模板 lint 已移除。原生转换检查仍直接调用生产 C++ 实现。完整用法、各项判定与依赖见 [test/README.md](test/README.md)。
 
 2026-11-08 分层验证：11 包构建通过；22 项模型/启动配置、2 项独立与总入口 mock 联动、1 项控制门恢复测试、15 项视觉回归及原生转换程序的 8 项检查通过。Piper mock 联动验证了无自动运动、底层模型读取、pose_1/pose_2 与 40 mm 总开口，未启动真机或相机。MoveIt 退出段错误仍作为明确警告记录，不能据此认定退出稳定性通过。
 
@@ -245,3 +253,27 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 详细记录：[相机实施说明](docs/camera_vision_implementation.md)、[联调报告](docs/camera_debugging_report.md)、[集成缺口、规划与底层合并记录](docs/real_grasp_integration_gaps.md)。已结合参考项目补齐底层配置，后续继续处理依赖退出缺陷、手眼标定、真实环境与执行反馈；视觉精度问题按计划后续处理。当前 `.gitignore` 忽略 `docs/`，这些本地文档尚不会自动随代码交付；因此主要使用方法和待办同时保留在本 README。
 
 仓库含多个上游组件，许可请分别查看对应包及厂商 SDK 的声明。
+
+### 三物料抓取与 ROS 域清理
+
+脚本入口统一放在 `script/*.sh`；入口使用的 Python 流程集中在 `script/build/*.py`，按同名文件对应。该目录存放随项目维护的源码，不是 colcon 生成目录。可修改参数仍放在根目录 `config/`。`my_robot_bringup` 仅负责 launch 编排。
+
+`script/three_material_grasp.sh` 启动控制、规划和视觉三层。`pre_grasp_target` 非空时，脚本先通过命名运动 Action 到该姿态（当前配置 `pose_1`），成功后才提交 `/sorting/sort_objects`，物料间也回该姿态观察；设为 `""` 则直接从当前位置开始，并关闭物料间固定回位。SortObjects 本身只接收策略和颜色列表，不检查是否到固定观察位，首次使用当前位置的新鲜观测；独立 Planner 默认也不回固定姿态。先编辑 [启动配置](config/three_material_grasp/startup.yaml)：`default_strategy`、`default_color_order`、`place_position_modes` 和 `place_positions` 都以该文件为本次任务的配置来源，覆盖基础 planner YAML 的对应项；基础文件不会被修改。Action 不再硬编码顺序，默认按 `[1, 2, 3]` 即红、绿、蓝每色选择一个目标。
+
+`place_position_modes` 是三种颜色共用的 `[x, y, z]` 模式，缺省为 `[absolute, absolute, absolute]`；`place_positions` 保持每色一个三维数值数组，单位米。absolute 表示物体放置中心的绝对坐标，relative 表示相对该物体本次抓取前中心的偏移，方向均沿 `base_link`，不跟随物体自身旋转。例如模式 `[relative, absolute, absolute]` 配合 red 的 `[-0.24, -0.06, -0.12]`，目标为 `[红块初始 x - 0.24, -0.06, -0.12]`。Planner 在派发时解析为绝对 place_pose；Executor 和 Action 接口不因放置模式改变。dry-run 只能显示规则，Planner 运行日志才显示当前物体及最终目标坐标。
+
+三个放置数组须根据现场填写；不要沿用 1 cm 仿真物块的 Z 高度。当前脚本 YAML 的 `launch.auto_enable` 为 true，会在真机启动时尝试使能；需要手动使能时改为 false。不要同时启动另一套相机或机械臂驱动。SortObjects 定义已简化，接口变更后须重建依赖程序并重启旧节点；当前位置启动仍要求有效 TF、当前观测和可规划的目标。
+
+```bash
+bash script/three_material_grasp.sh --dry-run  # 检查配置，不启动或运动
+bash script/three_material_grasp.sh            # 启动后自动发送实际分拣任务
+```
+
+支持 `--config 路径`，相对路径从工作区解析。脚本检查标定文件与视觉配置，并等待标定发布节点、与标定文件一致的手眼 TF、实时 `base_link` 到相机 TF 和分拣 Action；缺失时不发送抓取目标。运行时持续检查并在异常时请求取消，规划器及抓取执行器还在派发和各基本动作开始前检查 TF。**已有运动接口只能在当前基本动作结束后取消，不能保证 TF 突然丢失时立即停下**；急停仍须由现场人员操作。TF 存在也不代表位置精度合格：目前存在边缘抓取及深度偏差，实际全自动抓取前仍需验证目标中心、TCP 和标定。Action 成功只表示运动流程完成，还需目视验证。客户端结束后控制栈保持运行，避免持物时自动关闭；结束前应先确保机械臂及夹爪处于安全状态。
+
+```bash
+bash script/clear.sh --domain-id 189 --list  # 只列出
+bash script/clear.sh --domain-id 189         # 列出并确认后停止本地可识别的 ROS 进程
+```
+
+不传域时使用 `ROS_DOMAIN_ID`，环境变量也未设置时为 ROS 默认的 0。清理以当前用户、进程环境中的域和 ROS 进程特征为依据，可能无法识别自定义域上下文、其他用户或远程机器上的节点；ROS 节点也可能与其他节点共用一个进程。停止控制进程不等于机械臂安全停机或失能，清理前应确认现场状态。可用 `--yes` 跳过交互确认。

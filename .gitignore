@@ -2,6 +2,8 @@
 src/CMakeLists.txt
 devel
 build/
+!script/build/
+!script/build/*.py
 install/
 log/
 .vscode
@@ -18,4 +20,4 @@ oculus_reader/oculus_reader
 **/__pycache__/
 .thumbs
 docs/
-test/
+

@@ -33,7 +33,7 @@ def generate_launch_description():
         return str(Path(get_package_share_directory(package)) / 'config' / filename)
 
     return LaunchDescription([
-        DeclareLaunchArgument('control_mode', default_value='mock', choices=['mock', 'real']),
+        DeclareLaunchArgument('control_mode', default_value='real', choices=['mock', 'real']),
         DeclareLaunchArgument('use_sim_time', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('start_executor', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('start_planner', default_value='true', choices=['true', 'false']),

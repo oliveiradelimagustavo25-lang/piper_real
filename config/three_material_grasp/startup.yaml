@@ -1,0 +1,51 @@
+# 三物料抓取脚本配置：修改后重新运行 .sh 即可，无需为 YAML 修改重新构建。
+# 相对路径均以工作区根目录为基准；已有 ROS_DOMAIN_ID 环境变量优先于下面的值。
+environment:
+  ros_distro: humble
+  ros_domain_id: 189
+
+# 标定结果与各模块的基础配置。下方任务参数只覆盖本次临时配置，不修改这些文件。
+handeye_config: config/handeye_calibration/easy_handeye2.yaml
+handeye_directory: calibration/handeye
+perception_config: src/my_robot_perception/config/perception.yaml
+planner_config: src/my_robot_planner/config/task_planner.yaml
+manipulation_config: src/my_robot_commander/config/manipulation.yaml
+
+launch:
+  control_mode: real
+  can_port: can0
+  auto_enable: true   # 真机启动时尝试自动使能；需要手动使能时设为 false。
+  use_rviz: true
+  show_window: true
+
+# 脚本的可选预定位步骤，不是 SortObjects Action 的到位判定。
+# 非空：脚本先去该姿态，批次中的物料间也回到该姿态观察。
+# 设为 ""：从当前位置提交任务，关闭本批次固定姿态回位；须保证后续目标仍可观测。
+pre_grasp_target: pose_1
+
+# 本次任务的策略与颜色顺序，以这里为准；Action 留空对应字段，使用生成后的默认值。
+# color_order 按列表顺序处理；nearest 按距离选择，列表仅用于筛选参与的颜色。
+default_strategy: color_order
+default_color_order: [1, 2, 3]  # 1=红、2=绿、3=蓝，三物料任务要求每种颜色各出现一次。
+
+# 放置规则：三种颜色共用一个 [x, y, z] 模式数组，参数单位均为 m。
+# absolute = 下方该轴数值就是 base_link 下的绝对物体中心坐标。
+# relative = 下方该轴数值是偏移量；目标 = 该物体本次抓取前中心 + 偏移量。
+# 偏移方向沿 base_link 的坐标轴，不随物体自身旋转；每次派发任务只计算一次。
+place_position_modes: [relative, relative, relative]  # 全 absolute 保持原有用法。
+
+# 混合用法示例（不是当前生效的放置值）：
+#   place_position_modes: [relative, absolute, absolute]
+#   red: [-0.24, -0.06, -0.12]
+# 表示红块目标 = [红块初始 x - 0.24, -0.06, -0.12]。
+# Z 始终表示物体中心或其偏移，不是桌面高度，也不是夹爪 TCP。
+# 例：桌面 Z=-0.145 m、方块高 0.05 m，放置中心理论 Z=-0.120 m。
+# 请按真实场景填写三个数组；null 会使脚本报错，避免使用旧仿真放置点。
+# 相对模式下缺少实时物体位置，dry-run 只能显示规则；最终坐标由 Planner 打印。
+place_positions:
+  red: [-0.050, -0.010, 0.0005]
+  green: [-0.050, -0.010, 0.0005]
+  blue: [-0.050, -0.010, 0.0005]
+
+startup_timeout: 45.0  # 等待 TF、命名运动和分拣 Action 就绪的上限，s。
+max_tf_age: 1.0        # 机器人到相机动态 TF 的最大允许年龄，s。
