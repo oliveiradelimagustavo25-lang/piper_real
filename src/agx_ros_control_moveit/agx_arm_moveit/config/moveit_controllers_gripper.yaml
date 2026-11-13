@@ -19,6 +19,9 @@ moveit_simple_controller_manager:
 
   gripper_controller:
     type: FollowJointTrajectory
+    # Cover ros2_control's 3 s goal settling time, plus action/feedback latency.
+    allowed_execution_duration_scaling: 1.2
+    allowed_goal_duration_margin: 4.0
     joints:
       - gripper
     action_ns: follow_joint_trajectory

@@ -27,8 +27,8 @@ pick_place_executor:
     grasp_offset: [0.0, 0.0, 0.0]
 
     approach_distance: 0.04      # 物块上方的预抓取距离，m
-    lift_distance: 0.06          # 抓取后的最小抬升距离，m
-    transport_height: 0.08       # 当前地面小物块场景的 TCP 高度；桌面场景需重新配置，m
+    lift_distance: 0.06          # 闭爪后先沿 Z 轴直线抬升的距离，m
+    transport_height: 0.08       # 随后搬运目标的最低 TCP 高度（非原地直线抬升终点），m
     release_clearance: 0.002     # 放置时让物块底面略高于目标支撑面，m
     retreat_distance: 0.04       # 松开后向上撤离距离，m
 
@@ -36,7 +36,10 @@ pick_place_executor:
     gripper_width_joint: gripper
     gripper_open_width: 0.095    # 预张开宽度；当前模型上限 0.1 m，启动时校验
     gripper_pad_thickness: 0.003 # 每侧内表面垫片厚度；净开口=关节读数-两侧厚度
-    gripper_compression: 0.002   # 垫片间净开口比物块小 2 mm；不改变关节宽度接口的语义
+    gripper_compression: 0.004   # 总压缩量 4 mm；比原闭爪目标再小 2 mm（50 mm 方块：54→52 mm）
 
     max_target_age: 5.0          # 有时间戳的观测允许年龄，s；零时间戳用于手动目标
     tf_timeout: 0.3              # 坐标转换等待上限，s
+    startup_timeout: 60.0         # s，等待 MoveIt 就绪；失败明确退出，不无界等待
+    execution_timeout: 120.0      # s，单条轨迹的执行期限，超时请求取消
+    cancel_timeout: 5.0           # s，取消后等待最终结果；未知状态阻止新运动

@@ -1,4 +1,5 @@
 import ast
+import math
 
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -70,6 +71,10 @@ def build_moveit_config(context):
     tcp_offset = ast.literal_eval(
         LaunchConfiguration("tcp_offset").perform(context)
     )
+    if not isinstance(tcp_offset, (list, tuple)) or len(tcp_offset) != 6 or any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            for v in tcp_offset):
+        raise ValueError('tcp_offset must contain six finite numbers in m/rad')
 
     profile = _select_profile(effector_type, revo2_type)
     urdf_mappings = {
@@ -78,6 +83,9 @@ def build_moveit_config(context):
         "revo2_type": revo2_type,
         "tcp_offset_xyz": f"{tcp_offset[0]} {tcp_offset[1]} {tcp_offset[2]}",
         "tcp_offset_rpy": f"{tcp_offset[3]} {tcp_offset[4]} {tcp_offset[5]}",
+        "hardware_plugin": "my_robot_hardware/AgxTopicSystem" if
+            LaunchConfiguration('follow').perform(context) == 'true' else 'mock_components/GenericSystem',
+        "hardware_namespace": '/' + LaunchConfiguration('namespace').perform(context).strip('/'),
     }
     srdf_mappings = {
         "arm_type": arm_type,

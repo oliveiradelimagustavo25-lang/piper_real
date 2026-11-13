@@ -1,11 +1,12 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <xacro:macro name="agx_arm_ros2_control" params="name initial_positions_file arm_type effector_type revo2_type">
+  <xacro:macro name="agx_arm_ros2_control" params="name initial_positions_file arm_type effector_type revo2_type hardware_plugin hardware_namespace">
     <xacro:property name="initial_positions" value="${xacro.load_yaml(initial_positions_file)['initial_positions']}" />
 
     <ros2_control name="${name}" type="system">
       <hardware>
-        <plugin>mock_components/GenericSystem</plugin>
+        <plugin>${hardware_plugin}</plugin>
+        <param name="namespace">${hardware_namespace}</param>
       </hardware>
 
       <joint name="joint1">

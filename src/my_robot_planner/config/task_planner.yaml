@@ -14,8 +14,17 @@ task_planner:
 
     default_strategy: color_order
     default_color_order: [1, 2, 3]   # 红、绿、蓝
+    # 抓取区域初筛：reference_frame 下物体中心的 [x, y, z] 闭区间，单位 m。
+    # 默认关闭；启用前按现场填写上下界，每轴 min < max；零值仅为未配置占位。
+    # 仅跳过区域外目标，不裁剪视觉/碰撞数据，不代替 MoveIt 的抓姿与路径检查。
+    grasp_region_enabled: false
+    grasp_region_min: [0.0, 0.0, 0.0]
+    grasp_region_max: [0.0, 0.0, 0.0]
     max_observation_age: 2.0         # s，拒绝过期观测
-    observation_timeout: 5.0         # s，等待目标/TF/执行服务的最长时间
+    observation_timeout: 15.0        # s，暂时失测时等待恢复；不放宽上面的观测年龄
+    action_response_timeout: 5.0     # s，等待 PickPlace/命名运动接受请求
+    execution_timeout: 180.0         # s，单个 PickPlace/命名运动的执行期限
+    cancel_timeout: 10.0             # s，取消后等待结果；未知状态阻止新批次
 
     # 放置参数按 [x, y, z] 排列，单位 m，三种颜色共用下面的逐轴模式。
     # absolute：参数就是 reference_frame 下的绝对物体中心坐标。

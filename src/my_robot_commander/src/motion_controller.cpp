@@ -1,6 +1,8 @@
 #include "my_robot_commander/motion_controller.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -8,6 +10,8 @@
 
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/action/execute_trajectory.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 
 namespace my_robot_commander
@@ -26,11 +30,17 @@ bool finitePose(const geometry_msgs::msg::Pose & pose)
 struct MotionController::Impl
 {
   using Group = moveit::planning_interface::MoveGroupInterface;
+  using Execute = moveit_msgs::action::ExecuteTrajectory;
+  using Handle = rclcpp_action::ClientGoalHandle<Execute>;
   rclcpp::Node::SharedPtr node;
   Options options;
   std::unique_ptr<Group> arm;
   std::unique_ptr<Group> gripper;
   std::mutex mutex;
+  rclcpp_action::Client<Execute>::SharedPtr execute_client;
+  std::string error;
+  bool execution_unknown = false;
+  bool before_execution = true;
 
   Impl(const rclcpp::Node::SharedPtr & input_node, const Options & input_options)
   : node(input_node), options(input_options)
@@ -41,7 +51,9 @@ struct MotionController::Impl
     if (!(options.velocity_scaling > 0 && options.velocity_scaling <= 1 &&
       options.acceleration_scaling > 0 && options.acceleration_scaling <= 1 &&
       std::isfinite(options.planning_time) && options.planning_time > 0 &&
-      std::isfinite(options.cartesian_step) && options.cartesian_step > 0))
+      std::isfinite(options.cartesian_step) && options.cartesian_step > 0 &&
+      std::isfinite(options.execution_timeout) && options.execution_timeout > 0 &&
+      std::isfinite(options.cancel_timeout) && options.cancel_timeout > 0))
     {
       throw std::invalid_argument("Invalid motion scaling, planning time or Cartesian step");
     }
@@ -62,31 +74,121 @@ struct MotionController::Impl
     {
       throw std::invalid_argument("Invalid end effector link: " + options.end_effector_link);
     }
+    execute_client = rclcpp_action::create_client<Execute>(node, "execute_trajectory");
+  }
+
+  bool fail(const std::string & message)
+  {
+    error = message;
+    RCLCPP_WARN(node->get_logger(), "%s", message.c_str());
+    return false;
+  }
+
+  bool interrupted() const
+  {
+    return !rclcpp::ok() || (options.interrupted && options.interrupted());
+  }
+
+  template<typename Future>
+  bool wait(Future & future, double seconds, bool cancelable = true) const
+  {
+    using namespace std::chrono_literals;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    while (rclcpp::ok() && (!cancelable || !interrupted()) &&
+      std::chrono::steady_clock::now() < deadline)
+    {
+      if (future.wait_for(20ms) == std::future_status::ready) {return true;}
+    }
+    return future.wait_for(0ms) == std::future_status::ready;
+  }
+
+  bool execute(const moveit_msgs::msg::RobotTrajectory & trajectory)
+  {
+    before_execution = false;
+    using namespace std::chrono_literals;
+    if (execution_unknown) {return fail("Previous execution state is unknown; recovery required");}
+    if (interrupted()) {return fail("Motion canceled before execution");}
+    if (!execute_client->wait_for_action_server(2s)) {
+      return fail("ExecuteTrajectory server unavailable");
+    }
+    const auto cancel_late = std::make_shared<std::atomic<bool>>(false);
+    rclcpp_action::Client<Execute>::SendGoalOptions callbacks;
+    callbacks.goal_response_callback =
+      [client = execute_client, cancel_late](Handle::SharedPtr goal) {
+        if (goal && *cancel_late) {client->async_cancel_goal(goal);}
+      };
+    Execute::Goal request;
+    request.trajectory = trajectory;
+    // Latch before sending: exceptions or lost responses must never permit a
+    // second trajectory while the first one's state is unknown.
+    execution_unknown = true;
+    auto response = execute_client->async_send_goal(request, callbacks);
+    if (!wait(response, 5.0)) {
+      *cancel_late = true;
+      // Cover a response arriving between wait() and setting cancel_late.
+      if (response.wait_for(0ms) == std::future_status::ready) {
+        if (const auto late_handle = response.get()) {
+          execute_client->async_cancel_goal(late_handle);
+        }
+      }
+      return fail("ExecuteTrajectory response missing; execution state unknown");
+    }
+    const auto handle = response.get();
+    if (!handle) {
+      execution_unknown = false;
+      return fail("ExecuteTrajectory rejected the trajectory");
+    }
+    auto result = execute_client->async_get_result(handle);
+    const bool canceled = !wait(result, options.execution_timeout);
+    if (canceled) {
+      execute_client->async_cancel_goal(handle);
+      if (!wait(result, options.cancel_timeout, false)) {
+        return fail("Trajectory cancellation unconfirmed; execution state unknown");
+      }
+    }
+    const auto completed = result.get();
+    if (!completed.result) {
+      return fail("ExecuteTrajectory returned no result; execution state unknown");
+    }
+    if (completed.code == rclcpp_action::ResultCode::UNKNOWN) {
+      return fail("ExecuteTrajectory status unknown; recovery required");
+    }
+    execution_unknown = false;
+    if (canceled || interrupted()) {
+      return fail("Trajectory interrupted; no subsequent motion sent");
+    }
+    if (completed.code != rclcpp_action::ResultCode::SUCCEEDED ||
+      completed.result->error_code.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+    {
+      return fail(
+        "Trajectory execution failed, MoveIt code: " +
+        std::to_string(completed.result->error_code.val));
+    }
+    error.clear();
+    return true;
   }
 
   bool planAndExecute(Group & group)
   {
+    before_execution = true;
+    if (execution_unknown) {return fail("Previous execution state is unknown; recovery required");}
+    if (interrupted()) {return fail("Motion canceled before planning");}
     Group::Plan plan;
     const auto planned = group.plan(plan);
     if (planned != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(node->get_logger(), "Planning failed, MoveIt code: %d", planned.val);
-      return false;
+      return fail("Planning failed, MoveIt code: " + std::to_string(planned.val));
     }
-    const auto executed = group.execute(plan);
-    if (executed != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(node->get_logger(), "Execution failed, MoveIt code: %d", executed.val);
-      return false;
-    }
-    return true;
+    return execute(plan.trajectory_);
   }
 
   bool namedTarget(Group & group, const std::string & name)
   {
+    before_execution = true;
+    error.clear();
     group.clearPoseTargets();
     group.setStartStateToCurrentState();
     if (!group.setNamedTarget(name)) {
-      RCLCPP_ERROR(node->get_logger(), "Unknown named target: %s", name.c_str());
-      return false;
+      return fail("Unknown named target: " + name);
     }
     return planAndExecute(group);
   }
@@ -128,18 +230,17 @@ bool MotionController::moveToNamedTarget(const std::string & name)
 bool MotionController::moveToJoints(const std::vector<double> & joints)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->before_execution = true;
   auto & arm = *impl_->arm;
   if (joints.size() != arm.getVariableCount() ||
     !std::all_of(joints.begin(), joints.end(), [](double v) {return std::isfinite(v);}))
   {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Invalid joint count or non-finite joint value");
-    return false;
+    return impl_->fail("Invalid joint count or non-finite joint value");
   }
   arm.clearPoseTargets();
   arm.setStartStateToCurrentState();
   if (!arm.setJointValueTarget(joints)) {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Joint target is outside configured bounds");
-    return false;
+    return impl_->fail("Joint target is outside configured bounds");
   }
   return impl_->planAndExecute(arm);
 }
@@ -164,14 +265,14 @@ bool MotionController::moveToPose(
 bool MotionController::moveToPose(const geometry_msgs::msg::PoseStamped & pose, bool cartesian)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->before_execution = true;
   auto target = pose;
   auto & q = target.pose.orientation;
   const double norm = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
   if (target.header.frame_id.empty() || !finitePose(target.pose) ||
     !std::isfinite(norm) || norm < 1e-9)
   {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Invalid pose, quaternion or empty frame_id");
-    return false;
+    return impl_->fail("Invalid pose, quaternion or empty frame_id");
   }
   q.x /= norm; q.y /= norm; q.z /= norm; q.w /= norm;
   auto & arm = *impl_->arm;
@@ -182,27 +283,21 @@ bool MotionController::moveToPose(const geometry_msgs::msg::PoseStamped & pose, 
     if (arm.setPoseTarget(target)) {
       success = impl_->planAndExecute(arm);
     } else {
-      RCLCPP_ERROR(impl_->node->get_logger(), "MoveIt rejected pose target");
+      success = impl_->fail("MoveIt rejected pose target");
     }
   } else {
     // Cartesian API 的 waypoints 不含 Header，必须明确在统一参考系下输入。
     if (target.header.frame_id != impl_->options.reference_frame) {
-      RCLCPP_ERROR(
-        impl_->node->get_logger(), "Cartesian target must be in %s",
-        impl_->options.reference_frame.c_str());
-      return false;
+      return impl_->fail("Cartesian target must be in " + impl_->options.reference_frame);
     }
     moveit_msgs::msg::RobotTrajectory trajectory;
     const double fraction = arm.computeCartesianPath(
       {target.pose}, impl_->options.cartesian_step, 0.0, trajectory, true);
     if (fraction >= 1.0 - 1e-6 && !trajectory.joint_trajectory.points.empty()) {
-      const auto executed = arm.execute(trajectory);
-      success = executed == moveit::core::MoveItErrorCode::SUCCESS;
-      if (!success) {
-        RCLCPP_ERROR(impl_->node->get_logger(), "Cartesian execution failed: %d", executed.val);
-      }
+      success = impl_->execute(trajectory);
     } else {
-      RCLCPP_ERROR(impl_->node->get_logger(), "Cartesian path incomplete: %.1f%%", fraction * 100);
+      success = impl_->fail("Cartesian path incomplete: " + std::to_string(fraction * 100) +
+          "%; no partial trajectory executed (check IK, collision and target pose)");
     }
   }
   arm.clearPoseTargets();
@@ -223,17 +318,16 @@ bool MotionController::openGripper()
 bool MotionController::moveGripperToJoints(const std::vector<double> & joints)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->before_execution = true;
   auto & gripper = *impl_->gripper;
   if (joints.size() != gripper.getVariableCount() ||
     !std::all_of(joints.begin(), joints.end(), [](double v) {return std::isfinite(v);}))
   {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Invalid gripper joint target");
-    return false;
+    return impl_->fail("Invalid gripper joint target");
   }
   gripper.setStartStateToCurrentState();
   if (!gripper.setJointValueTarget(joints)) {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Gripper target is outside configured bounds");
-    return false;
+    return impl_->fail("Gripper target is outside configured bounds");
   }
   return impl_->planAndExecute(gripper);
 }
@@ -246,27 +340,61 @@ bool MotionController::closeGripper()
 bool MotionController::moveGripperToWidth(double width)
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->before_execution = true;
   auto & gripper = *impl_->gripper;
   const auto limits = impl_->widthLimits();
   if (!std::isfinite(width) || width < limits.first || width > limits.second) {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Gripper width is outside model limits");
-    return false;
+    return impl_->fail("Gripper width is outside model limits");
   }
   gripper.setStartStateToCurrentState();
   // Set the independent joint by name; MoveIt updates its mimic fingers.
   if (!gripper.setJointValueTarget(
       std::map<std::string, double>{{impl_->options.gripper_width_joint, width}}))
   {
-    RCLCPP_ERROR(impl_->node->get_logger(), "Gripper width is outside configured bounds");
-    return false;
+    return impl_->fail("Gripper width is outside configured bounds");
   }
-  return impl_->planAndExecute(gripper);
+  const bool executed = impl_->planAndExecute(gripper);
+  if (const auto state = gripper.getCurrentState(0.2)) {
+    const double actual = state->getVariablePosition(impl_->options.gripper_width_joint);
+    RCLCPP_INFO(impl_->node->get_logger(),
+      "Gripper target %.1f mm, feedback %.1f mm, target-feedback %.1f mm; command %s (grasp unverified)",
+      width * 1000, actual * 1000, (width - actual) * 1000, executed ? "completed" : "failed");
+  }
+  return executed;
 }
 
 std::pair<double, double> MotionController::gripperWidthLimits() const
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->widthLimits();
+}
+
+void MotionController::validateLinks(const std::vector<std::string> & links) const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  for (const auto & link : links) {
+    if (link.empty() || !impl_->arm->getRobotModel()->hasLinkModel(link)) {
+      throw std::invalid_argument("Unknown robot link: " + link);
+    }
+  }
+}
+
+std::string MotionController::lastError() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->error;
+}
+
+bool MotionController::lastFailureBeforeExecution() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->before_execution && !impl_->error.empty() && !impl_->execution_unknown;
+}
+
+bool MotionController::executionStateKnown() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return !impl_->execution_unknown;
 }
 
 }  // namespace my_robot_commander

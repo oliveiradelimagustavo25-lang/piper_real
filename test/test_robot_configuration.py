@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_share_directory
-from launch import LaunchContext
+from launch import LaunchContext, LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
 from launch_ros.actions import Node
@@ -87,11 +87,15 @@ def test_named_states_fit_actual_model(arm, effector):
     ('true', 'feedback/joint_states'), ('false', 'control/joint_states')])
 def test_follow_selects_official_state(follow, expected):
     builder = module(MOVEIT / 'launch/_moveit_config_builder.py')
-    ctx = LaunchContext()
-    ctx.launch_configurations['follow'] = follow
+    ctx = context(LaunchDescription(builder.declare_common_args()), follow=follow)
     assert builder.joint_state_topic(ctx) == expected
     names = {action.name for action in builder.declare_common_args()}
     assert not names.intersection({'feedback_topic', 'control_topic', 'enable_octomap'})
+    config = builder.build_moveit_config(ctx)
+    model = ET.fromstring(config.robot_description['robot_description'])
+    plugin = model.find('ros2_control/hardware/plugin').text
+    assert plugin == ('my_robot_hardware/AgxTopicSystem' if follow == 'true' else
+                      'mock_components/GenericSystem')
 
 
 def test_official_driver_endpoints_are_not_renamed():
@@ -126,7 +130,7 @@ def test_driver_compositions_keep_official_endpoints(entry):
     ('mock', 'demo.launch.py'), ('real', 'start_single_agx_arm_moveit.launch.py')])
 def test_control_layer_starts_only_control(mode, entry):
     launch = module(BRINGUP / 'robot_control_moveit.launch.py')
-    ctx = context(launch.generate_launch_description(), control_mode=mode)
+    ctx = context(launch.generate_launch_description(), control_mode=mode, auto_enable='false')
     group, = launch.make_nodes(ctx)
     actions = group.get_sub_entities()
     include = next(a for a in actions if isinstance(a, IncludeLaunchDescription))
@@ -155,6 +159,19 @@ def test_middle_consumes_control_without_rebuilding_model(mode, states):
     assert 'robot_description' not in names and 'robot_description_semantic' not in names
 
 
+@pytest.mark.parametrize('key,value', [('tool_to_tcp', [0., 0., .15]),
+                                      ('end_effector_frame', 'tcp_link')])
+def test_middle_rejects_inconsistent_tool_contract(tmp_path, key, value):
+    launch = module(BRINGUP / 'robot_motion_planning.launch.py')
+    path = tmp_path / 'planner.yaml'
+    config = yaml.safe_load((ROOT / 'src/my_robot_planner/config/task_planner.yaml').read_text())
+    config['task_planner']['ros__parameters'][key] = value
+    path.write_text(yaml.safe_dump(config))
+    ctx = context(launch.generate_launch_description(), planner_config=str(path))
+    with pytest.raises(ValueError, match='must agree'):
+        launch.make_nodes(ctx)
+
+
 @pytest.mark.parametrize('mode,depth,show_window,expected', [
     ('color', 'true', 'true', ['color_detector', 'depth_localizer']),
     ('color', 'false', 'false', ['color_detector']),
@@ -168,7 +185,7 @@ def test_perception_layer_selects_nodes(mode, depth, show_window, expected):
     launch = module(BRINGUP / 'robot_perception.launch.py')
     desc = launch.generate_launch_description()
     ctx = context(desc, perception_mode=mode, enable_depth=depth,
-                  show_window=show_window, start_camera='false')
+                  show_window=show_window, start_camera='false', publish_handeye_tf='false')
     nodes = launch.make_nodes(ctx)
     assert [n.node_executable for n in nodes] == expected
     for node in nodes:
@@ -286,10 +303,10 @@ def test_startup_requires_calibration_and_real_place_positions(valid_grasp_confi
     assert planner['place_position_modes'] == ['absolute'] * 3
     assert planner['one_object_per_color'] is True
     assert config['pre_grasp_target'] == planner['observation_target'] == 'pose_1'
+    assert config['post_grasp_target'] == 'home'
     assert planner['default_strategy'] == config['default_strategy'] == 'color_order'
     assert planner['default_color_order'] == config['default_color_order'] == [1, 2, 3]
-    assert planner['required_camera_frame'] == executor['required_camera_frame']
-    assert planner['required_camera_frame'] == config['handeye']['tracking_base_frame']
+    assert 'required_camera_frame' not in planner and 'required_camera_frame' not in executor
     data = grasp.load_yaml(valid_grasp_config)
     data['place_positions']['red'] = None
     valid_grasp_config.write_text(yaml.safe_dump(data))
@@ -334,6 +351,43 @@ def test_startup_task_parameters_override_only_the_generated_config(valid_grasp_
     assert config['planner']['task_planner']['ros__parameters']['observation_target'] == ''
 
 
+def test_grasp_region_override_and_inheritance(valid_grasp_config, tmp_path):
+    settings = grasp.load_yaml(valid_grasp_config)
+    base = grasp.load_yaml(grasp.workspace_path(settings['planner_config']))
+    base['task_planner']['ros__parameters'].update(
+        grasp_region_enabled=True, grasp_region_min=[.1, -.3, -.2], grasp_region_max=[.6, .3, .2])
+    path = tmp_path / 'base_planner.yaml'
+    original = yaml.safe_dump(base)
+    path.write_text(original)
+    settings['planner_config'] = str(path)
+    for override, enabled, lower, upper in (
+            (None, True, [.1, -.3, -.2], [.6, .3, .2]),
+            ({'min': [.2, -.2, -.15]}, True, [.2, -.2, -.15], [.6, .3, .2]),
+            ({'enabled': False}, False, [.1, -.3, -.2], [.6, .3, .2])):
+        settings['grasp_region'] = override
+        valid_grasp_config.write_text(yaml.safe_dump(settings))
+        params = grasp.load_settings(valid_grasp_config)['planner']['task_planner']['ros__parameters']
+        assert params['grasp_region_min'] == lower
+        assert params['grasp_region_max'] == upper
+        assert params['grasp_region_enabled'] == enabled
+        assert path.read_text() == original
+
+
+@pytest.mark.parametrize('region', [
+    {}, {'enabled': 'true'}, {'min': [], 'max': [1., 1., 1.]},
+    {'min': [0., 0.], 'max': [1., 1., 1.]},
+    {'enabled': True, 'min': [0., 0., 0.], 'max': [0., 1., 1.]},
+    {'min': [float('nan'), 0., 0.], 'max': [1., 1., 1.]},
+    {'min': [False, 0., 0.], 'max': [1., 1., 1.]},
+])
+def test_invalid_grasp_region_rejected(valid_grasp_config, region):
+    settings = grasp.load_yaml(valid_grasp_config)
+    settings['grasp_region'] = region
+    valid_grasp_config.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match='grasp_region'):
+        grasp.load_settings(valid_grasp_config)
+
+
 @pytest.mark.parametrize('modes', [
     ['absolute', 'relative'], ['relative', 'unknown', 'absolute'], [True, False, False]])
 def test_invalid_place_position_modes_are_rejected(valid_grasp_config, modes):
@@ -344,8 +398,55 @@ def test_invalid_place_position_modes_are_rejected(valid_grasp_config, modes):
         grasp.load_settings(valid_grasp_config)
 
 
-@pytest.mark.parametrize('outcome', ['success', 'rejected', 'failed', 'tf_lost', 'current_pose'])
-def test_optional_pre_grasp_precedes_sorting(monkeypatch, outcome):
+@pytest.mark.parametrize('phase,reason', [('response', '未获得目标响应'),
+                                       ('execution', '执行超时'),
+                                       ('cancel', '取消后结果未确认'),
+                                       ('empty_result', '空结果')])
+def test_grasp_client_waits_are_bounded(monkeypatch, phase, reason):
+    from concurrent.futures import Future
+    import rclpy
+
+    clock, canceled = [0.], []
+    sent, completed = Future(), Future()
+
+    class Handle:
+        accepted = True
+
+        def get_result_async(self):
+            return completed
+
+        def cancel_goal_async(self):
+            canceled.append(True)
+            if phase == 'execution':
+                completed.set_result(None)
+
+    if phase != 'response':
+        sent.set_result(Handle())
+    if phase == 'empty_result':
+        completed.set_result(None)
+    monkeypatch.setattr(rclpy, 'ok', lambda: True)
+    monkeypatch.setattr(rclpy, 'spin_once', lambda *a, **k: clock.__setitem__(0, clock[0] + .1))
+    monkeypatch.setattr(grasp.time, 'monotonic', lambda: clock[0])
+    client = SimpleNamespace(send_goal_async=lambda *a, **k: sent)
+    with pytest.raises(RuntimeError, match=reason):
+        grasp.execute_goal(None, client, None, lambda: None, 'test',
+                           response_timeout=.2, execution_timeout=.3, cancel_timeout=.2)
+    assert bool(canceled) == (phase in ('execution', 'cancel'))
+
+
+@pytest.mark.parametrize('value', [None, False, 7, []])
+def test_invalid_post_grasp_target_is_rejected(valid_grasp_config, value):
+    settings = grasp.load_yaml(valid_grasp_config)
+    settings['post_grasp_target'] = value
+    valid_grasp_config.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match='post_grasp_target'):
+        grasp.load_settings(valid_grasp_config)
+
+
+@pytest.mark.parametrize('outcome', [
+    'success', 'rejected', 'failed', 'tf_lost', 'current_pose', 'post_disabled',
+    'post_rejected', 'post_failed', 'sort_failed', 'post_custom'])
+def test_script_named_poses_wrap_sorting(monkeypatch, outcome):
     from concurrent.futures import Future
     from action_msgs.msg import GoalStatus
     import rclpy
@@ -376,6 +477,12 @@ def test_optional_pre_grasp_precedes_sorting(monkeypatch, outcome):
 
     class Named:
         def send_goal_async(self, goal, feedback_callback=None):
+            if goal.target != 'pose_1':
+                assert goal.target == ('pose_2' if outcome == 'post_custom' else 'home')
+                assert events[-1] == 'sort_finished'
+                events.append('send_return')
+                return ready(SimpleNamespace(accepted=outcome != 'post_rejected',
+                             get_result_async=lambda: ready(response(outcome != 'post_failed'))))
             assert goal.target == 'pose_1'
             events.append('send_named')
             return ready(Handle())
@@ -389,7 +496,12 @@ def test_optional_pre_grasp_precedes_sorting(monkeypatch, outcome):
             assert goal.strategy == '' and list(goal.color_order) == []
             assert not hasattr(goal, 'skip_initial_observation')
             events.append('send_sort')
-            return ready(SimpleNamespace(accepted=True, get_result_async=lambda: ready(response())))
+
+            def finished():
+                events.append('sort_finished')
+                return ready(response(outcome != 'sort_failed'))
+
+            return ready(SimpleNamespace(accepted=True, get_result_async=finished))
 
     def spin(*args, **kwargs):
         if not motion_result.done() and outcome != 'tf_lost':
@@ -402,19 +514,31 @@ def test_optional_pre_grasp_precedes_sorting(monkeypatch, outcome):
 
     monkeypatch.setattr(rclpy, 'ok', lambda: True)
     monkeypatch.setattr(rclpy, 'spin_once', spin)
-    if outcome in ('success', 'current_pose'):
-        target = '' if outcome == 'current_pose' else 'pose_1'
-        assert grasp.execute_sequence(None, Named(), Sorting(), {'pre_grasp_target': target}, check).success
-        assert events == (['send_sort'] if not target else ['send_named', 'named_finished', 'send_sort'])
+    config = {'pre_grasp_target': '' if outcome == 'current_pose' else 'pose_1'}
+    if outcome in ('post_disabled', 'post_custom'):
+        config['post_grasp_target'] = '' if outcome == 'post_disabled' else 'pose_2'
+    if outcome in ('success', 'current_pose', 'post_disabled', 'post_custom'):
+        assert grasp.execute_sequence(None, Named(), Sorting(), config, check).success
+        expected = [] if outcome == 'current_pose' else ['send_named', 'named_finished']
+        expected += ['send_sort', 'sort_finished']
+        if outcome != 'post_disabled':
+            expected.append('send_return')
+        assert events == expected
     else:
         with pytest.raises(RuntimeError):
-            grasp.execute_sequence(None, Named(), Sorting(), {'pre_grasp_target': 'pose_1'}, check)
-        assert 'send_sort' not in events
+            grasp.execute_sequence(None, Named(), Sorting(), config, check)
+        if outcome in ('rejected', 'failed', 'tf_lost'):
+            assert 'send_sort' not in events
+        else:
+            assert 'sort_finished' in events
+            assert ('send_return' in events) == (outcome != 'sort_failed')
         if outcome == 'tf_lost':
             assert 'cancel_named' in events
 
 
-def test_live_tf_checks_publisher_calibration_and_freshness(valid_grasp_config):
+def test_live_tf_checks_calibration_and_freshness(valid_grasp_config):
+    from tf2_ros import LookupException
+
     config = grasp.load_settings(valid_grasp_config)
     translation = SimpleNamespace(**dict(zip('xyz', config['translation'])))
     quaternion = SimpleNamespace(**dict(zip('xyzw', config['rotation'])))
@@ -422,24 +546,23 @@ def test_live_tf_checks_publisher_calibration_and_freshness(valid_grasp_config):
     chain = SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=100, nanosec=0)))
 
     class Buffer:
+        available = True
+
         def lookup_transform(self, target, source, stamp):
+            if not self.available:
+                raise LookupException('No camera TF')
             return edge if target == config['handeye']['robot_effector_frame'] else chain
 
     class Node:
-        publishers = [('handeye_publisher', '/')]
-
-        def get_node_names_and_namespaces(self):
-            return self.publishers
-
         def get_clock(self):
             return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=100_500_000_000))
 
-    node = Node()
-    grasp.check_tf(node, Buffer(), config)
-    node.publishers = []
-    with pytest.raises(RuntimeError, match='发布节点不存在'):
-        grasp.check_tf(node, Buffer(), config)
-    node.publishers = [('handeye_publisher', '/')]
+    node, buffer = Node(), Buffer()
+    grasp.check_tf(node, buffer, config)  # Any publisher may provide the validated transform.
+    buffer.available = False
+    with pytest.raises(LookupException, match='No camera TF'):
+        grasp.check_tf(node, buffer, config)
+    buffer.available = True
     chain.header.stamp.sec = 95
     with pytest.raises(RuntimeError, match='过期'):
         grasp.check_tf(node, Buffer(), config)

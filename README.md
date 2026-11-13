@@ -15,6 +15,7 @@
 | `src/my_robot_perception/` | 原始 RGB 颜色分割、深度关联和 ArUco 检测节点 |
 | `src/my_robot_interface/` | 上层模块共用的消息与 Action 定义 |
 | `src/my_robot_commander/` | MoveIt 运动封装、抓放执行器和碰撞场景管理 |
+| `src/my_robot_hardware/` | ros2_control 的官方 AGX 话题适配库，接收真实反馈并下发命令 |
 | `src/my_robot_planner/` | 根据感知对象组织分拣任务，调用执行层 Action |
 | `src/my_robot_bringup/` | 三个独立分层入口与总入口：控制、运动/行为规划、相机感知 |
 | `test/` | 五个按职责划分的 Python 测试入口，`native/` 保留实际 C++ 转换验证源 |
@@ -115,11 +116,11 @@ ros2 launch my_robot_bringup robot.launch.py control_mode:=real can_port:=can0 \
   perception_mode:=color show_window:=true
 ```
 
-底层和总入口的 `control_mode` 默认 `mock`，不会启动 CAN 驱动。真机模式的 `auto_enable` 默认 `false`，使能须按实际设备状态操作。上层和总入口的 `start_camera` 默认 `true`，会打开相机；离线验证示例：
+当前工作区底层和总入口的 `control_mode` 默认 `real`、`auto_enable` 默认 `true`，会连接并尝试使能真机；这是现有启动配置，本轮未更改。上层的 `start_camera` 和 `publish_handeye_tf` 默认均为 `true`。离线验证必须显式指定 mock、关闭相机及保存的手眼 TF 发布，例如：
 
 ```bash
 ros2 launch my_robot_bringup robot.launch.py control_mode:=mock \
-  use_rviz:=false start_camera:=false show_window:=false
+  use_rviz:=false start_camera:=false show_window:=false publish_handeye_tf:=false
 ```
 
 底层可以独立用 RViz/MoveIt 控制机器人；视觉可以独立检测并输出相机坐标结果。中层按开关仅装配启用的组件，关闭执行器时不读取它的运动学配置；执行器缺底层时等待规划场景服务；启动本身不派发抓取任务。总入口只组合三层、汇总参数，每层参数作用域独立。查看当前完整参数：
@@ -150,9 +151,9 @@ motion.openGripper();                           // 官方 gripper_open，100 mm
 motion.closeGripper();                          // 官方 gripper_close，0 mm
 ```
 
-夹爪命名状态只保留官方 `gripper_open/gripper_half/gripper_close`，已移除新增的 `open/close` 别名。数值宽度不依赖命名状态，抓放 YAML 的 `gripper_open_width` 仍为 0.07 m。独立关节 `gripper` 表示总开口，`gripper_joint1/2` 由模型 mimic 派生，不使用旧 `joint7/joint8` 手指向量。arm 保留 `pose_1/pose_2`；真实支架、桌面和运动路径仍需实物确认。
+夹爪命名状态只保留官方 `gripper_open/gripper_half/gripper_close`，已移除新增的 `open/close` 别名。数值宽度不依赖命名状态，抓放 YAML 的 `gripper_open_width` 为 0.095 m，并按模型限位检查。独立关节 `gripper` 表示总开口，`gripper_joint1/2` 由模型 mimic 派生，不使用旧 `joint7/joint8` 手指向量。arm 保留 `pose_1/pose_2`；真实支架、桌面和运动路径仍需实物确认。
 
-接口长度为 m、角度为 rad；输入或规划/执行被拒时返回 false，配置及 ROS/MoveIt 异常可向调用者抛出。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示 MoveIt 报告轨迹成功，不表示已确认真机到位或夹住物体。当前库不提供运动中取消，执行器 Action 在当前基本动作结束后取消后续步骤。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。更换行为规划节点可复用这些 Action；更换轨迹规划算法由底层 MoveIt pipeline 配置负责。
+接口长度为 m、角度为 rad；输入或规划/执行被拒时返回 false，配置及 ROS/MoveIt 异常可向调用者抛出，`lastError()` 提供最近的运动错误。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示轨迹执行成功；real 模式按真实关节反馈及配置容差判断，仍不证明绝对 TCP 精度或夹持成功。执行器会将取消请求传到 ExecuteTrajectory；取消结果未知时阻止后续运动，不等同于急停。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。
 
 抓放执行器在闭合命令成功后才附着模型；闭合不确定、附着失败或搬运失败时，不自动开爪或假定空手。`/manipulation/release_held_object` 是显式恢复接口，可能真实开爪，须先确认承托和现场状态。状态不确定时拒绝新抓取与命名运动；已附着的对象在运动失败后仍保留碰撞模型。
 
@@ -160,7 +161,7 @@ motion.closeGripper();                          // 官方 gripper_close，0 mm
 
 相机挂载 TF 留待手眼标定，未迁入参考项目的错误外参；缺机器人 TF 时，相机二维检测和相机系测量仍可独立工作，`base_link` 物体输出尚不完整。`tcp_offset` 默认零，执行器 `tool_to_tcp` 仍需实际核对。启动层不再管理 Octomap 开关；当前没有启用相机障碍输入，固定碰撞环境由中层管理。
 
-当前真机路径仍沿用 AGX 的 mock 控制器到 SDK 的命令桥接，未将硬件反馈写入 ros2_control state interface；控制器成功不能证明真机到位。本机 MoveIt 2.5.10 的退出阶段 `move_group` 段错误尚未修复，本次分层重构不代表真机闭环或正常退出已验收。记录见 [分层构建报告](docs/real_grasp_integration_gaps.md#9-三层启动与接口边界2026-11-08)。
+real 模式已改用 `my_robot_hardware/AgxTopicSystem`：`/feedback/joint_states` 写入真实状态接口，`/control/joint_states` 仅由适配器下发命令；广播器状态改发 `/controller_joint_states`，不再混入命令话题。启动先同步实际关节，缺失、过期或非法反馈不能激活；运行中反馈失效会停止发布并请求停用本系统的运动控制器，不自动恢复。mock 保留 GenericSystem。相关参数、故障恢复边界及验证见[链路可靠性修复记录](docs/control_reliability_repair.md)。本轮尚未复验真机，关节容差不代表实际 TCP 精度；本机 MoveIt 2.5.10 退出阶段段错误仍未解决，不能用自动重启掩盖。
 
 ## 视觉启动与参数
 
@@ -184,7 +185,7 @@ ros2 launch my_robot_bringup robot_perception.launch.py \
 - `show_window`：默认 `true`；false 关闭全部窗口。`perception_mode:=none show_window:=false` 不启动检测/预览节点，相机驱动是否启动仍由 `start_camera` 决定。
 - `enable_depth`：默认 `true`，只影响 color/both 模式；false 保留纯 RGB 检测，不等待深度标注。
 - `perception_config`：默认使用已安装的 `perception.yaml`。修改源码配置后可重建，或直接传入其绝对路径。
-- `publish_handeye_tf`：默认 `false`；开启后发布已保存的手眼标定。二维显示、颜色检测和相机系 ArUco 位姿不要求手眼 TF；输出基座系物体位置需要完整 TF。该开关不代表 launch 会等待 TF 后才启动视觉节点。
+- `publish_handeye_tf`：当前默认 `true`，发布已保存的手眼标定；独立二维测试可显式关闭。二维显示、颜色检测和相机系 ArUco 位姿不要求手眼 TF；输出基座系物体位置需要完整 TF。该开关不代表 launch 会等待 TF 后才启动视觉节点。
 - `use_sim_time`：默认 `false`；播放带 `/clock` 的录包时按需设置。
 
 直接使用工作区源码配置的示例：
@@ -240,6 +241,8 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 
 2026-11-08 分层验证：11 包构建通过；22 项模型/启动配置、2 项独立与总入口 mock 联动、1 项控制门恢复测试、15 项视觉回归及原生转换程序的 8 项检查通过。Piper mock 联动验证了无自动运动、底层模型读取、pose_1/pose_2 与 40 mm 总开口，未启动真机或相机。MoveIt 退出段错误仍作为明确警告记录，不能据此认定退出稳定性通过。
 
+2026-11-10 链路可靠性修复：14 个依赖包构建成功，集中离线回归 `79 passed, 5 warnings`（129.00 s），原生转换入口含 9 项 C++ 检查。新增用例覆盖真实状态适配器的合成反馈、无反馈拒绝激活、反馈故障停用、运动中取消、执行超时和客户端等待期限。手眼 GUI 与非法配置退出也已回归；尚未复验真机。详细范围、命令与剩余限制见[修复记录](docs/control_reliability_repair.md)，Planner 新能力见[待审方案](docs/planner_upgrade_proposal.md)。
+
 2026-11-07 用户实测反馈：已测试四个场景的实时检测，color 效果改善，部分物体识别较准确。本阶段接受保留以下问题，后续再处理：
 
 | 待改进项 | 当前记录 |
@@ -256,11 +259,19 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 
 ### 三物料抓取与 ROS 域清理
 
+整批分拣成功后，脚本通过现有命名运动接口回到 `post_grasp_target`，在 `config/three_material_grasp/startup.yaml` 中配置，默认 `home`，`""` 表示不回位，也可改为其他 SRDF arm 命名姿态。它与预定位/观察姿态 `pre_grasp_target` 分别配置。脚本等待结束回位成功才结束；分拣失败、取消或结果不明时不自动回位。
+
+闭爪压缩量位于 `src/my_robot_commander/config/manipulation.yaml`：`gripper_compression: 0.004` 表示总压缩量 4 mm，比之前的闭合目标再小 2 mm。当前 50 mm 轴对齐方块、每侧 3 mm 垫片，对应机械开口目标 `50 + 6 - 4 = 52 mm`；预张开宽度保持 95 mm。脚本读取源 YAML，修改这两处配置后重新运行即可，无需为 YAML 改动构建。
+
 脚本入口统一放在 `script/*.sh`；入口使用的 Python 流程集中在 `script/build/*.py`，按同名文件对应。该目录存放随项目维护的源码，不是 colcon 生成目录。可修改参数仍放在根目录 `config/`。`my_robot_bringup` 仅负责 launch 编排。
 
 `script/three_material_grasp.sh` 启动控制、规划和视觉三层。`pre_grasp_target` 非空时，脚本先通过命名运动 Action 到该姿态（当前配置 `pose_1`），成功后才提交 `/sorting/sort_objects`，物料间也回该姿态观察；设为 `""` 则直接从当前位置开始，并关闭物料间固定回位。SortObjects 本身只接收策略和颜色列表，不检查是否到固定观察位，首次使用当前位置的新鲜观测；独立 Planner 默认也不回固定姿态。先编辑 [启动配置](config/three_material_grasp/startup.yaml)：`default_strategy`、`default_color_order`、`place_position_modes` 和 `place_positions` 都以该文件为本次任务的配置来源，覆盖基础 planner YAML 的对应项；基础文件不会被修改。Action 不再硬编码顺序，默认按 `[1, 2, 3]` 即红、绿、蓝每色选择一个目标。
 
 `place_position_modes` 是三种颜色共用的 `[x, y, z]` 模式，缺省为 `[absolute, absolute, absolute]`；`place_positions` 保持每色一个三维数值数组，单位米。absolute 表示物体放置中心的绝对坐标，relative 表示相对该物体本次抓取前中心的偏移，方向均沿 `base_link`，不跟随物体自身旋转。例如模式 `[relative, absolute, absolute]` 配合 red 的 `[-0.24, -0.06, -0.12]`，目标为 `[红块初始 x - 0.24, -0.06, -0.12]`。Planner 在派发时解析为绝对 place_pose；Executor 和 Action 接口不因放置模式改变。dry-run 只能显示规则，Planner 运行日志才显示当前物体及最终目标坐标。
+
+抓取区域筛选位于 Planner 内部：物体转换到 `reference_frame` 后、固定批次 ID 前，按物体中心的 XYZ 闭区间排除区域外目标；后续派发前也会复查。参数为 `task_planner.yaml` 的 `grasp_region_enabled/min/max`，默认关闭，零值上下界仅是占位，启用前须按现场填写。`startup.yaml` 的 `grasp_region: null` 或省略该项表示继承；映射中的 `enabled/min/max` 分别覆盖基础参数，`{enabled: false}` 显式关闭。修改 YAML 后重新启动脚本即可，不需重新构建。区域外目标本批不再加入，即使随后进入区域，也需新批次；日志和结果 message 列出跳过 ID、数量及完成数量。全部越界返回失败；其余候选流程均完成可返回成功，并保留跳过汇总。尚未观察到的指定颜色仍按原有期限等待。视觉话题和碰撞场景保持完整；该功能不验证物体整体包围盒、放置区域、逆解或路径可达性。
+
+夹爪位置到位检查由底层 `agx_arm_moveit/launch/demo.launch.py` 函数内的固定值 `gripper_goal_tolerance = 0.0`（m）关闭，避免接触物体后因未达到计算开口而中止，不读取环境变量，也不对外提供 YAML、脚本或 launch 参数。该设置作用于夹爪的张开、闭合及定宽运动，完成仅表示命令流程完成，不保证实际开口到位或物体已夹住。机械最大开度、机械臂关节容差、反馈断流保护、超时和取消仍保留。修改该安装脚本后需构建 agx_arm_moveit 同步，再安全重启原控制栈。日志分别打印闭合目标计算与实际开口；当前几何输入仍是固定尺寸方块，更换物体须同步其尺寸与抓姿假设。
 
 三个放置数组须根据现场填写；不要沿用 1 cm 仿真物块的 Z 高度。当前脚本 YAML 的 `launch.auto_enable` 为 true，会在真机启动时尝试使能；需要手动使能时改为 false。不要同时启动另一套相机或机械臂驱动。SortObjects 定义已简化，接口变更后须重建依赖程序并重启旧节点；当前位置启动仍要求有效 TF、当前观测和可规划的目标。
 
@@ -269,7 +280,13 @@ bash script/three_material_grasp.sh --dry-run  # 检查配置，不启动或运�
 bash script/three_material_grasp.sh            # 启动后自动发送实际分拣任务
 ```
 
-支持 `--config 路径`，相对路径从工作区解析。脚本检查标定文件与视觉配置，并等待标定发布节点、与标定文件一致的手眼 TF、实时 `base_link` 到相机 TF 和分拣 Action；缺失时不发送抓取目标。运行时持续检查并在异常时请求取消，规划器及抓取执行器还在派发和各基本动作开始前检查 TF。**已有运动接口只能在当前基本动作结束后取消，不能保证 TF 突然丢失时立即停下**；急停仍须由现场人员操作。TF 存在也不代表位置精度合格：目前存在边缘抓取及深度偏差，实际全自动抓取前仍需验证目标中心、TCP 和标定。Action 成功只表示运动流程完成，还需目视验证。客户端结束后控制栈保持运行，避免持物时自动关闭；结束前应先确保机械臂及夹爪处于安全状态。
+支持 `--config 路径`，相对路径从工作区解析。脚本检查标定文件与视觉配置，并等待与文件一致的手眼 TF、实时 `base_link` 到相机 TF 和分拣 Action；缺失时不发送抓取目标，不要求 TF 发布器使用固定节点名。启动就绪等待为 90 s，硬件首批反馈等待为 40 s，执行器等待 MoveIt 为 60 s。
+
+Planner 派发前检查新观测，短暂失测最多等待 15 s 恢复，观测最大年龄仍为 2 s；单条非法记录不影响其他有效目标。感知在图像采集时刻转换坐标，Planner/Executor 仅在输入坐标系需要转换时查询对应 TF，已在基座系的目标不额外依赖当前相机 TF。执行开始后按固定目标完成，不要求物体持续可见。深度配对断流期限为 3 s，等待期间不重发旧目标；恢复后自动继续定位。无效场景观测不覆盖或删除已知障碍。
+
+`PickPlace.Result.error_code` 区分目标不可用、轨迹执行失败和需要恢复。接触前的输入或规划失败只跳过该目标，本批不再重试，其他物体继续处理；执行故障、可能持物或结果不明时停止后续动作。批次末尾汇总未完成目标，存在跳过的失败目标时 `SortObjects.success=false`，完成数只计实际成功的运动流程。脚本报“抓取流程未完成”并保留控制栈，不能把这一任务结果当成节点崩溃。新增了 Action 结果字段，旧节点和终端须统一重新加载构建后的工作区再使用。
+
+抬升先沿 Z 轴移动 lift_distance，再通过碰撞检查的搬运规划到达 transport_height；不执行残缺直线路径。脚本在执行期间监测启动进程、Action 期限与取消，请求响应、整批执行和取消确认受 `action_timeouts` 约束。**软件取消、TF 检查或停止发布命令均不保证真机立即停下**。TF 存在不代表精度合格，实际自动抓取前仍需验证目标中心、TCP 和标定。Action 成功只表示运动流程完成，夹持与放置仍需核实。客户端结束后控制栈保持运行，关闭前应确认现场状态。
 
 ```bash
 bash script/clear.sh --domain-id 189 --list  # 只列出

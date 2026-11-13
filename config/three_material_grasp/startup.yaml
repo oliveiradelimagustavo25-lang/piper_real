@@ -23,10 +23,25 @@ launch:
 # 设为 ""：从当前位置提交任务，关闭本批次固定姿态回位；须保证后续目标仍可观测。
 pre_grasp_target: pose_1
 
+# 整批分拣成功后，通过同一命名运动接口回到此姿态；"" 表示不回位。
+# 分拣失败、取消或状态不明时不自动回位。home 是 SRDF 姿态，不是设置硬件零点。
+post_grasp_target: home
+
 # 本次任务的策略与颜色顺序，以这里为准；Action 留空对应字段，使用生成后的默认值。
 # color_order 按列表顺序处理；nearest 按距离选择，列表仅用于筛选参与的颜色。
 default_strategy: color_order
 default_color_order: [1, 2, 3]  # 1=红、2=绿、3=蓝，三物料任务要求每种颜色各出现一次。
+
+# null 或不填写：继承 planner_config 中的 grasp_region_enabled/min/max。
+# 可按需覆盖 enabled/min/max；启用示例结构（上下界须自行填写，单位 m）：
+# grasp_region:
+#   enabled: true
+#   min: [x_min, y_min, z_min]
+#   max: [x_max, y_max, z_max]
+# 坐标沿 Planner 的 reference_frame（当前 base_link），边界包含在区域内。
+# {enabled: false} 显式关闭。区域内不保证抓姿/路径可达。
+# 区域外目标不计入本批抓取；结果 message 汇总跳过 ID，completed_count 只计实际流程完成数。
+grasp_region: null
 
 # 放置规则：三种颜色共用一个 [x, y, z] 模式数组，参数单位均为 m。
 # absolute = 下方该轴数值就是 base_link 下的绝对物体中心坐标。
@@ -47,5 +62,11 @@ place_positions:
   green: [-0.050, -0.010, 0.0005]
   blue: [-0.050, -0.010, 0.0005]
 
-startup_timeout: 45.0  # 等待 TF、命名运动和分拣 Action 就绪的上限，s。
+startup_timeout: 90.0  # s，外层就绪期限；长于硬件首批反馈 40 s 和执行器等待 MoveIt 60 s。
 max_tf_age: 1.0        # 机器人到相机动态 TF 的最大允许年龄，s。
+
+# 脚本客户端的等待期限，不覆盖 Planner/Executor 各自的轨迹期限；单位 s。
+action_timeouts:
+  response_timeout: 5.0
+  execution_timeout: 600.0  # 整批三物料总期限（预定位和结束回位各自复用该上限）
+  cancel_timeout: 10.0     # 无最终结果则报状态未知，保留控制栈，不自动重发

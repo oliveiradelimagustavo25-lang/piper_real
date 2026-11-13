@@ -1,0 +1,7 @@
+<library path="agx_topic_system">
+  <class name="my_robot_hardware/AgxTopicSystem"
+         type="my_robot_hardware::AgxTopicSystem"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>Actual AGX feedback, with commands synchronized before activation.</description>
+  </class>
+</library>

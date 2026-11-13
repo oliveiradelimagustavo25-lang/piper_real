@@ -38,8 +38,10 @@ T parameter(const rclcpp::Node::SharedPtr & node, const std::string & name, T fa
 
 tf2::Vector3 vector3(const std::vector<double> & values)
 {
-  if (values.size() != 3) {
-    throw std::invalid_argument("Expected an xyz or rpy parameter with 3 values");
+    if (values.size() != 3 || !std::all_of(values.begin(), values.end(),
+      [](double v) {return std::isfinite(v);}))
+    {
+      throw std::invalid_argument("Expected an xyz or rpy parameter with 3 finite values");
   }
   return {values[0], values[1], values[2]};
 }
@@ -87,7 +89,7 @@ class PickPlaceExecutor
 
 public:
   explicit PickPlaceExecutor(const rclcpp::Node::SharedPtr & node)
-  : node_(node), tf_buffer_(node->get_clock()), tf_listener_(tf_buffer_)
+  : node_(node), tf_buffer_(node->get_clock())
   {
     Motion::Options options;
     options.arm_group = parameter(node_, "arm_group", options.arm_group);
@@ -102,6 +104,9 @@ public:
       options.acceleration_scaling);
     options.planning_time = parameter(node_, "planning_time", options.planning_time);
     options.cartesian_step = parameter(node_, "cartesian_step", options.cartesian_step);
+    options.execution_timeout = parameter(node_, "execution_timeout", options.execution_timeout);
+    options.cancel_timeout = parameter(node_, "cancel_timeout", options.cancel_timeout);
+    options.interrupted = [this]() {return cancel_requested_.load();};
     tool_to_tcp_ = vector3(parameter<std::vector<double>>(node_, "tool_to_tcp", {0, 0, 0.132}));
     offset_ = vector3(parameter<std::vector<double>>(node_, "grasp_offset", {0, 0, 0}));
     const auto rpy = vector3(
@@ -115,16 +120,17 @@ public:
     retreat_ = parameter(node_, "retreat_distance", 0.04);
     open_width_ = parameter(node_, "gripper_open_width", 0.095);
     pad_thickness_ = parameter(node_, "gripper_pad_thickness", 0.0);
-    compression_ = parameter(node_, "gripper_compression", 0.002);
+    compression_ = parameter(node_, "gripper_compression", 0.004);
     max_age_ = parameter(node_, "max_target_age", 5.0);
     tf_timeout_ = parameter(node_, "tf_timeout", 0.3);
-    camera_frame_ = parameter<std::string>(node_, "required_camera_frame", "");
-    camera_tf_max_age_ = parameter(node_, "camera_tf_max_age", 1.0);
-    if (!std::isfinite(open_width_) || !std::isfinite(pad_thickness_) ||
+    const std::vector<double> distances{approach_, lift_, transport_z_, clearance_, retreat_,
+      max_age_, tf_timeout_};
+    if (!std::all_of(distances.begin(), distances.end(), [](double v) {return std::isfinite(v);}) ||
+      max_age_ <= 0 || tf_timeout_ < 0 || frame_.empty() ||
+      !std::isfinite(open_width_) || !std::isfinite(pad_thickness_) ||
       !std::isfinite(compression_) || pad_thickness_ < 0 ||
       open_width_ <= 2 * pad_thickness_ || compression_ < 0 ||
-      approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0 ||
-      !std::isfinite(camera_tf_max_age_) || camera_tf_max_age_ <= 0)
+      approach_ <= 0 || lift_ <= 0 || retreat_ <= 0 || clearance_ < 0)
     {
       throw std::invalid_argument("Invalid gripper configuration or approach/lift/retreat distances");
     }
@@ -132,15 +138,29 @@ public:
     // Robot descriptions are received from the control stack's latched topics.
     auto planning_scene = node_->create_client<moveit_msgs::srv::GetPlanningScene>(
       "get_planning_scene");
+    const auto startup_timeout = parameter(node_, "startup_timeout", 60.0);
+    if (!std::isfinite(startup_timeout) || startup_timeout <= 0) {
+      throw std::invalid_argument("startup_timeout must be positive and finite");
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration<double>(startup_timeout);
     while (!planning_scene->wait_for_service(std::chrono::seconds(1))) {
       if (!rclcpp::ok()) {
         throw std::runtime_error("Shutdown while waiting for MoveIt");
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("Timed out waiting for get_planning_scene; start the control layer");
       }
       RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 5000,
         "Waiting for control stack: get_planning_scene");
     }
     motion_ = std::make_unique<Motion>(node_, options);
+    motion_->validateLinks({options.end_effector_link});
+    const auto touch_links = parameter<std::vector<std::string>>(
+      node_, "touch_links", {"gripper_link1", "gripper_link2"});
+    if (touch_links.empty()) {throw std::invalid_argument("touch_links must not be empty");}
+    motion_->validateLinks(touch_links);
     const auto width_limits = motion_->gripperWidthLimits();
     if (open_width_ < width_limits.first || open_width_ > width_limits.second) {
       throw std::invalid_argument("gripper_open_width is outside the loaded robot model limits");
@@ -163,14 +183,17 @@ public:
     server_ = rclcpp_action::create_server<Action>(
       node_, name,
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const Action::Goal> goal) {
-        if (!validGoal(*goal) || grasp_state_ != GraspState::Empty || busy_.exchange(true)) {
+        if (busy_ || !validGoal(*goal) || grasp_state_ != GraspState::Empty ||
+          !motion_->executionStateKnown() || busy_.exchange(true))
+        {
           RCLCPP_WARN(node_->get_logger(), "Rejected invalid/busy goal or pending grasp recovery");
           return rclcpp_action::GoalResponse::REJECT;
         }
+        cancel_requested_ = false;
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
       },
-      [](const std::shared_ptr<GoalHandle>) {
-        // 当前运动调用为同步执行：接受取消，在当前动作结束后停止后续动作。
+      [this](const std::shared_ptr<GoalHandle>) {
+        cancel_requested_ = true;
         return rclcpp_action::CancelResponse::ACCEPT;
       },
       [this](const std::shared_ptr<GoalHandle> handle) {
@@ -179,19 +202,22 @@ public:
         }
         worker_ = std::thread([this, handle]() {execute(handle);});
       });
-    RCLCPP_INFO(node_->get_logger(), "PickPlace executor ready: %s", name.c_str());
     named_server_ = rclcpp_action::create_server<NamedAction>(
       node_,
       parameter<std::string>(node_, "move_to_named_action", "/manipulation/move_to_named"),
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const NamedAction::Goal> goal) {
-        if (goal->target.empty() || grasp_state_ == GraspState::NeedsRecovery ||
-          grasp_state_ == GraspState::Released || busy_.exchange(true))
+        if (busy_ || goal->target.empty() || grasp_state_ == GraspState::NeedsRecovery ||
+          grasp_state_ == GraspState::Released || !motion_->executionStateKnown() || busy_.exchange(true))
         {
           return rclcpp_action::GoalResponse::REJECT;
         }
+        cancel_requested_ = false;
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
       },
-      [](std::shared_ptr<NamedHandle>) {return rclcpp_action::CancelResponse::ACCEPT;},
+      [this](std::shared_ptr<NamedHandle>) {
+        cancel_requested_ = true;
+        return rclcpp_action::CancelResponse::ACCEPT;
+      },
       [this](std::shared_ptr<NamedHandle> handle) {
         if (worker_.joinable()) {worker_.join();}
         worker_ = std::thread([this, handle]() {executeNamed(handle);});
@@ -207,7 +233,11 @@ public:
           response->message = "Executor is busy";
           return;
         }
+        cancel_requested_ = false;
         try {
+          if (!motion_->executionStateKnown()) {
+            throw std::runtime_error("Motion state unknown; verify the controller before gripper recovery");
+          }
           if (grasp_state_ != GraspState::Released) {
             grasp_state_ = GraspState::NeedsRecovery;
             if (!motion_->moveGripperToWidth(open_width_)) {
@@ -234,7 +264,7 @@ public:
           return;
         }
         try {
-          if (grasp_state_ != GraspState::Empty) {
+          if (grasp_state_ != GraspState::Empty || !motion_->executionStateKnown()) {
             throw std::runtime_error("Grasp recovery is pending; objects cannot be cleared");
           }
           const auto count = scene_->clearObserved();
@@ -251,6 +281,10 @@ public:
         }
         busy_ = false;
       }, rmw_qos_profile_services_default, recovery_group_);
+    // Create the listener last: failed startup validation must not wait for a
+    // TF thread while the ROS context is still active during stack unwinding.
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(tf_buffer_);
+    RCLCPP_INFO(node_->get_logger(), "PickPlace executor ready: %s", name.c_str());
   }
 
   ~PickPlaceExecutor()
@@ -280,14 +314,15 @@ private:
       if (!handle->is_canceling()) {
         result->success = motion_->moveToNamedTarget(handle->get_goal()->target);
       }
-      result->message = result->success ? "Named target reached" : "Named motion failed";
+      result->message = result->success ? "Named target reached" :
+        "Named motion failed: " + motion_->lastError();
     } catch (const std::exception & error) {
       result->message = error.what();
     }
     if (rclcpp::ok()) {
       if (handle->is_canceling()) {
         result->success = false;
-        result->message = "Canceled after current named motion";
+        result->message = "Named motion cancellation completed; verify physical state before recovery";
         handle->canceled(result);
       } else if (result->success) {
         handle->succeed(result);
@@ -333,10 +368,12 @@ private:
   void execute(const std::shared_ptr<GoalHandle> & handle)
   {
     auto result = std::make_shared<Action::Result>();
+    result->error_code = Action::Result::TARGET_UNAVAILABLE;
     auto feedback = std::make_shared<Action::Feedback>();
     const auto stage = [&](uint8_t value, const std::string & message) {
         feedback->stage = value;
         feedback->message = message;
+        RCLCPP_INFO(node_->get_logger(), "%s", message.c_str());
         if (rclcpp::ok()) {
           handle->publish_feedback(feedback);
         }
@@ -345,18 +382,13 @@ private:
         if (interrupted(handle)) {
           throw std::runtime_error("Canceled before " + name);
         }
-        if (!camera_frame_.empty()) {
-          const auto transform = tf_buffer_.lookupTransform(frame_, camera_frame_, tf2::TimePointZero);
-          const auto stamp = rclcpp::Time(
-            transform.header.stamp, node_->get_clock()->get_clock_type());
-          const double age = (node_->now() - stamp).seconds();
-          if (stamp.nanoseconds() == 0 || age < -0.1 || age > camera_tf_max_age_) {
-            throw std::runtime_error("Required camera TF is stale before " + name);
-          }
-        }
         stage(feedback->stage, name);
+        result->error_code = Action::Result::EXECUTION_FAILED;
         if (!operation()) {
-          throw std::runtime_error(name + " failed");
+          if (motion_->lastFailureBeforeExecution()) {
+            result->error_code = Action::Result::TARGET_UNAVAILABLE;
+          }
+          throw std::runtime_error(name + " failed: " + motion_->lastError());
         }
       };
     const auto move = [&](const tf2::Vector3 & tcp, bool cartesian) {
@@ -368,6 +400,7 @@ private:
 
     try {
       stage(Action::Feedback::PREPARING, "Preparing object and tool targets");
+      // Transform at the observation time, then execute the fixed base-frame snapshot.
       const auto goal = handle->get_goal();
       const auto stamp = rclcpp::Time(
         goal->object_pose.header.stamp,
@@ -399,9 +432,12 @@ private:
       }
       const auto pre_pick = pick + tf2::Vector3(0, 0, approach_);
       const double safe_z = std::max({transport_z_, pick.z() + lift_, put.z() + retreat_});
-      const tf2::Vector3 lifted(pick.x(), pick.y(), safe_z);
+      // Lift the requested clearance vertically; reach transport height during
+      // the subsequent collision-checked transfer, not at maximum reach.
+      const tf2::Vector3 lifted(pick.x(), pick.y(), pick.z() + lift_);
       const tf2::Vector3 pre_place(put.x(), put.y(), safe_z);
 
+      result->error_code = Action::Result::EXECUTION_FAILED;
       syncScene();
       scene_->prepare(goal->object_id, object, goal->object_dimensions);
 
@@ -414,7 +450,11 @@ private:
           // A failed/partial close can still contact an object. Never silently
           // mark it empty or attach before the close command has completed.
           grasp_state_ = GraspState::NeedsRecovery;
-          if (!grip(2 * pad_thickness_ + std::max(0.0, width - compression_))) {return false;}
+          const double target_width = 2 * pad_thickness_ + std::max(0.0, width - compression_);
+          RCLCPP_INFO(node_->get_logger(),
+            "Close gripper: projected object %.1f mm, pad per side %.1f mm, compression %.1f mm -> target %.1f mm",
+            width * 1000, pad_thickness_ * 1000, compression_ * 1000, target_width * 1000);
+          if (!grip(target_width)) {return false;}
           scene_->attach();
           grasp_state_ = GraspState::Attached;
           return true;
@@ -451,10 +491,13 @@ private:
       result->success = false;
       result->message += "; restoring collision checks failed: " + std::string(error.what());
     }
+    if (result->success) {result->error_code = Action::Result::NONE;} else if (
+      grasp_state_ != GraspState::Empty || !motion_->executionStateKnown())
+    {result->error_code = Action::Result::RECOVERY_REQUIRED;}
     if (rclcpp::ok()) {
       if (handle->is_canceling()) {
         result->success = false;
-        result->message = "Canceled after current motion; gripper state retained";
+        result->message = "Cancellation handled; gripper state retained; " + result->message;
         if (grasp_state_ != GraspState::Empty) {result->message += "; explicit recovery required";}
         handle->canceled(result);
       } else if (result->success) {
@@ -471,7 +514,7 @@ private:
 
   rclcpp::Node::SharedPtr node_;
   tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<Motion> motion_;
   std::unique_ptr<Scene> scene_;
   std::mutex observations_mutex_;
@@ -486,11 +529,12 @@ private:
   std::thread worker_;
   std::atomic<bool> busy_{false};
   std::atomic<GraspState> grasp_state_{GraspState::Empty};
-  std::string frame_, camera_frame_;
+  std::atomic<bool> cancel_requested_{false};
+  std::string frame_;
   tf2::Vector3 tool_to_tcp_, offset_;
   tf2::Quaternion tool_rotation_;
   double approach_, lift_, transport_z_, clearance_, retreat_;
-  double open_width_, pad_thickness_, compression_, max_age_, tf_timeout_, camera_tf_max_age_;
+  double open_width_, pad_thickness_, compression_, max_age_, tf_timeout_;
 };
 
 int main(int argc, char ** argv)

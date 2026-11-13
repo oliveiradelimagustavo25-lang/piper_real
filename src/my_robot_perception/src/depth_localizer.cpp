@@ -54,8 +54,8 @@ public:
     objects_frame_ = declare_parameter<std::string>("objects_frame", "base_link", startup_only);
     const auto dimensions = declare_parameter<std::vector<double>>(
       "object_dimensions", {0.01, 0.01, 0.01}, startup_only);
-    top_tolerance_ = declare_parameter<double>("top_surface_tolerance", 0.002, startup_only);
-    tf_timeout_ = declare_parameter<double>("tf_timeout", 0.1, startup_only);
+    top_tolerance_ = declare_parameter<double>("top_surface_tolerance", 0.004, startup_only);
+    tf_timeout_ = declare_parameter<double>("tf_timeout", 0.3, startup_only);
     if (objects_frame_.empty() || dimensions.size() != 3 ||
       !std::all_of(
         dimensions.begin(), dimensions.end(),
@@ -81,7 +81,7 @@ public:
     {
       throw std::invalid_argument("Invalid depth, pixel count, erosion or sync parameters");
     }
-    input_timeout_ = declare_parameter<double>("input_timeout", 1.0, startup_only);
+    input_timeout_ = declare_parameter<double>("input_timeout", 3.0, startup_only);
     surface_separation_ = declare_parameter<double>("surface_separation", 0.005, startup_only);
     if (!std::isfinite(input_timeout_) || input_timeout_ <= 0 ||
       !std::isfinite(surface_separation_) || surface_separation_ <= 0)
@@ -530,6 +530,7 @@ private:
 
   void localize(const Image::ConstSharedPtr & labels_msg, const Image::ConstSharedPtr & depth_msg)
   {
+    if (input_stale_) {RCLCPP_INFO(get_logger(), "RGB/depth pairing recovered");}
     last_pair_received_ = std::chrono::steady_clock::now();
     input_stale_ = false;
     if (labels_msg->encoding != "mono8" ||

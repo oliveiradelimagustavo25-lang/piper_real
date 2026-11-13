@@ -138,7 +138,7 @@ def test_live_synthetic_pipeline(tmp_path):
     process = subprocess.Popen([
         'ros2', 'launch', str(ROOT.parent / 'my_robot_bringup/launch/robot_perception.launch.py'),
         f'perception_config:={config}', 'perception_mode:=both',
-        'start_camera:=false', 'show_window:=false'],
+        'start_camera:=false', 'show_window:=false', 'publish_handeye_tf:=false'],
         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         deadline = time.monotonic() + 12
@@ -169,12 +169,14 @@ def test_live_synthetic_pipeline(tmp_path):
 
         # Symmetric depth noise must not become a high object centre through
         # selecting the upper tail of the measured surface heights.
-        noisy = depth.copy()
-        noisy[95:116, 145:166] += np.random.default_rng(17).uniform(-.004, .004, (21, 21))
-        stamps = send(pixels=noisy)
-        centres = [obj.pose.position.z for message in selected(objects, stamps)
-                   for obj in message.objects if obj.color == 1]
-        assert centres and np.median(centres) == pytest.approx(.675, abs=.0015)
+        for noise in (np.random.default_rng(17).uniform(-.004, .004, (21, 21)),
+                      np.where(np.indices((21, 21)).sum(axis=0) % 2, .003, -.003)):
+            noisy = depth.copy()
+            noisy[95:116, 145:166] += noise
+            stamps = send(pixels=noisy)
+            centres = [obj.pose.position.z for message in selected(objects, stamps)
+                       for obj in message.objects if obj.color == 1]
+            assert centres and np.median(centres) == pytest.approx(.675, abs=.0015)
 
         partial = depth.copy()
         partial[95:116, 155:166] = np.nan
@@ -258,11 +260,15 @@ def test_live_synthetic_pipeline(tmp_path):
         cloud = next(m for m in reversed(selected(points, stamps)) if m.width)
         assert xyz(cloud)[2] == pytest.approx(1.04, abs=.002)
         check_caption(stamps, 'red1: 1040 mm')
-        # Loss of paired input must actively invalidate geometry, not just stop publishing.
+        # A short gap must not manufacture observations. Sustained loss clears
+        # geometry after the configured grace period; new input then recovers.
         points.clear()
+        objects.clear()
         send(pixels=None)
-        spin(.3)
+        assert not points and not objects
+        spin(settings['depth_localizer']['ros__parameters']['input_timeout'])
         assert points and all(m.width == 0 for m in points)
+        assert objects and all(not m.objects for m in objects)
 
         # Invalid calibration must not replace the last valid calibration.
         bad_di = copy.deepcopy(di)

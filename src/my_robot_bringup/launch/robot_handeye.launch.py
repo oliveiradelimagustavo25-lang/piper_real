@@ -51,6 +51,8 @@ def make_nodes(context):
         PythonLaunchDescriptionSource(str(share / 'launch/robot_perception.launch.py')),
         launch_arguments={
             'perception_mode': 'aruco', 'enable_depth': 'false',
+            # Sampling must not load the previous calibration through perception defaults.
+            'publish_handeye_tf': 'false',
             **{name: LaunchConfiguration(name) for name in (
                 'perception_config', 'start_camera', 'show_window', 'use_sim_time')},
         }.items()))

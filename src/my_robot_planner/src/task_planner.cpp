@@ -2,8 +2,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -30,19 +32,25 @@ class TaskPlanner : public rclcpp::Node
   using Object = my_robot_interface::msg::DetectedObject;
   using Objects = my_robot_interface::msg::DetectedObjectArray;
   using SortHandle = rclcpp_action::ServerGoalHandle<Sort>;
-  using PickHandle = rclcpp_action::ClientGoalHandle<Pick>;
-  using NamedHandle = rclcpp_action::ClientGoalHandle<Named>;
-  enum class Phase {WAITING, SENDING, EXECUTING, OBSERVING};
+  enum class Phase {WAITING, SENDING, EXECUTING};
 
 public:
   TaskPlanner() : Node("task_planner"), tf_buffer_(get_clock())
   {
     frame_ = declare_parameter<std::string>("reference_frame", "base_link");
     tool_frame_ = declare_parameter<std::string>("end_effector_frame", "link6");
-    camera_frame_ = declare_parameter<std::string>("required_camera_frame", "");
-    camera_tf_max_age_ = declare_parameter<double>("camera_tf_max_age", 1.0);
     one_per_color_ = declare_parameter<bool>("one_object_per_color", false);
     tool_to_tcp_ = xyz(declare_parameter<std::vector<double>>("tool_to_tcp", {0, 0, 0.132}));
+    filter_region_ = declare_parameter<bool>("grasp_region_enabled", false);
+    region_min_ = xyz(declare_parameter<std::vector<double>>("grasp_region_min", {0., 0., 0.}));
+    region_max_ = xyz(declare_parameter<std::vector<double>>("grasp_region_max", {0., 0., 0.}));
+    if (filter_region_) {
+      for (int axis = 0; axis < 3; ++axis) {
+        if (region_min_[axis] >= region_max_[axis]) {
+          throw std::invalid_argument("grasp_region_min must be below grasp_region_max on each axis");
+        }
+      }
+    }
     default_strategy_ = declare_parameter<std::string>("default_strategy", "color_order");
     const auto order = declare_parameter<std::vector<int64_t>>("default_color_order", {1, 2, 3});
     for (const auto color : order) {
@@ -52,7 +60,10 @@ public:
       default_order_.push_back(static_cast<uint8_t>(color));
     }
     max_age_ = declare_parameter<double>("max_observation_age", 2.0);
-    timeout_ = declare_parameter<double>("observation_timeout", 5.0);
+    timeout_ = declare_parameter<double>("observation_timeout", 15.0);
+    response_timeout_ = declare_parameter<double>("action_response_timeout", 5.0);
+    execution_timeout_ = declare_parameter<double>("execution_timeout", 180.0);
+    cancel_timeout_ = declare_parameter<double>("cancel_timeout", 10.0);
     observation_target_ = declare_parameter<std::string>("observation_target", "");
     settle_time_ = declare_parameter<double>("observation_settle_time", 0.3);
     const auto place_modes = declare_parameter<std::vector<std::string>>(
@@ -73,7 +84,9 @@ public:
     if (!validPolicy(default_strategy_, default_order_) || frame_.empty() || tool_frame_.empty() ||
       !std::isfinite(max_age_) || max_age_ <= 0 || !std::isfinite(timeout_) || timeout_ <= 0 ||
       !std::isfinite(settle_time_) || settle_time_ < 0 ||
-      !std::isfinite(camera_tf_max_age_) || camera_tf_max_age_ <= 0)
+      !std::isfinite(response_timeout_) || response_timeout_ <= 0 ||
+      !std::isfinite(execution_timeout_) || execution_timeout_ <= 0 ||
+      !std::isfinite(cancel_timeout_) || cancel_timeout_ <= 0)
     {
       throw std::invalid_argument("Invalid task policy, frames or observation timeouts");
     }
@@ -93,7 +106,8 @@ public:
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const Sort::Goal> goal) {
         const auto strategy = goal->strategy.empty() ? default_strategy_ : goal->strategy;
         const auto & order = goal->color_order.empty() ? default_order_ : goal->color_order;
-        if (busy_ || !validPolicy(strategy, order)) {
+        if (busy_ || execution_unknown_ || !validPolicy(strategy, order)) {
+          RCLCPP_WARN(get_logger(), "Sort rejected: busy, invalid policy or unknown execution state");
           return rclcpp_action::GoalResponse::REJECT;
         }
         busy_ = true;
@@ -106,16 +120,15 @@ public:
         strategy_ = goal->strategy.empty() ? default_strategy_ : goal->strategy;
         order_ = goal->color_order.empty() ? default_order_ : goal->color_order;
         pending_.clear();
+        skipped_.clear();
+        unavailable_.clear();
         batch_ready_ = false;
         completed_ = 0;
-        phase_ = Phase::WAITING;
         // A new batch starts at the current pose. A named observation pose is
         // an optional between-object policy, never an Action precondition.
-        needs_observation_ = false;
-        observations_after_ = now() + rclcpp::Duration::from_seconds(settle_time_);
-        observations_.reset();
-        waiting_since_ = std::chrono::steady_clock::now();
-        waiting_reason_.clear();
+        awaitObservations();
+        stop_reason_.clear();
+        stop_since_.reset();
         feedback("");
       });
     // 所有任务状态都在同一个 executor 中更新；Action 等待使用异步回调。
@@ -155,8 +168,8 @@ private:
       transform = tf_buffer_.lookupTransform(frame_, header.frame_id, rclcpp::Time(header.stamp));
     }
     std::set<std::string> ids;
-    auto objects = observations_->objects;
-    for (auto & object : objects) {
+    std::vector<Object> objects;
+    for (auto object : observations_->objects) {
       const auto & p = object.pose.position;
       const auto & d = object.dimensions;
       tf2::Quaternion q;
@@ -167,7 +180,9 @@ private:
         !std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z) ||
         d.x <= 0 || d.y <= 0 || d.z <= 0 || !std::isfinite(q.length2()) || q.length2() < 1e-12)
       {
-        throw std::invalid_argument("Invalid object ID, color, pose or dimensions");
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Ignoring invalid object ID, color, pose or dimensions: '%s'", object.object_id.c_str());
+        continue;
       }
       q.normalize();
       object.pose.orientation = tf2::toMsg(q);
@@ -178,6 +193,7 @@ private:
         tf2::doTransform(source, result, transform);
         object.pose = result.pose;
       }
+      objects.push_back(std::move(object));
     }
     return objects;
   }
@@ -210,6 +226,28 @@ private:
       });
   }
 
+  void filterRegion(std::vector<Object> & objects)
+  {
+    if (!filter_region_) {return;}
+    objects.erase(std::remove_if(objects.begin(), objects.end(), [this](const auto & object) {
+      if (std::find(order_.begin(), order_.end(), object.color) == order_.end() ||
+        (batch_ready_ && pending_.count(object.object_id) == 0)) {return false;}
+      const auto & p = object.pose.position;
+      const tf2::Vector3 point(p.x, p.y, p.z);
+      for (int axis = 0; axis < 3; ++axis) {
+        if (point[axis] < region_min_[axis] || point[axis] > region_max_[axis]) {
+          if (skipped_.insert(object.object_id).second) {
+            RCLCPP_WARN(get_logger(), "Skipping %s: centre [%.3f, %.3f, %.3f] outside grasp region in %s",
+              object.object_id.c_str(), p.x, p.y, p.z, frame_.c_str());
+          }
+          pending_.erase(object.object_id);
+          return true;
+        }
+      }
+      return skipped_.count(object.object_id) != 0;
+    }), objects.end());
+  }
+
   void feedback(const std::string & id)
   {
     auto update = std::make_shared<Sort::Feedback>();
@@ -221,19 +259,26 @@ private:
   void finish(bool success, const std::string & message, bool canceled = false)
   {
     auto result = std::make_shared<Sort::Result>();
-    result->success = success;
+    result->success = success && unavailable_.empty();
     result->message = message;
+    if (!skipped_.empty()) {
+      result->message += "; completed=" + std::to_string(completed_) + ", skipped_outside_grasp_region=" +
+        std::to_string(skipped_.size()) + " IDs:";
+      for (const auto & id : skipped_) {result->message += " " + id;}
+    }
+    for (const auto & item : unavailable_) {
+      result->message += "; unavailable " + item.first + ": " + item.second;
+    }
     if (canceled) {
       task_->canceled(result);
-    } else if (success) {
+    } else if (result->success) {
       task_->succeed(result);
     } else {
       task_->abort(result);
     }
-    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    RCLCPP_INFO(get_logger(), "%s", result->message.c_str());
     task_.reset();
-    active_pick_.reset();
-    active_named_.reset();
+    cancel_active_ = {};
     busy_ = false;
   }
 
@@ -250,40 +295,69 @@ private:
     }
   }
 
+  void awaitObservations(bool move_to_observation = false)
+  {
+    phase_ = Phase::WAITING;
+    needs_observation_ = move_to_observation;
+    observations_.reset();
+    observations_after_ = now() + rclcpp::Duration::from_seconds(settle_time_);
+    waiting_since_ = std::chrono::steady_clock::now();
+    waiting_reason_.clear();
+  }
+
+  template<typename Action, typename OnResult>
+  void sendGoal(
+    const std::shared_ptr<rclcpp_action::Client<Action>> & client,
+    const typename Action::Goal & goal, const std::string & label, OnResult on_result)
+  {
+    using Handle = rclcpp_action::ClientGoalHandle<Action>;
+    phase_ = Phase::SENDING;
+    phase_since_ = std::chrono::steady_clock::now();
+    cancel_sent_ = false;
+    const auto task = task_;
+    typename rclcpp_action::Client<Action>::SendGoalOptions options;
+    options.goal_response_callback = [this, task, client, label](typename Handle::SharedPtr handle) {
+        if (task_ != task) {
+          if (handle) {client->async_cancel_goal(handle);}
+          return;
+        }
+        if (!handle) {
+          finish(false, label + " rejected", task->is_canceling());
+        } else {
+          cancel_active_ = [client, handle]() {client->async_cancel_goal(handle);};
+          phase_ = Phase::EXECUTING;
+          phase_since_ = std::chrono::steady_clock::now();
+        }
+      };
+    options.result_callback = [this, task, label, on_result](const typename Handle::WrappedResult & r) {
+        if (task_ != task) { return; }
+        cancel_active_ = {};
+        if (!r.result || r.code == rclcpp_action::ResultCode::UNKNOWN) {
+          execution_unknown_ = true;
+          finish(false, label + " returned no result; recovery required", task->is_canceling());
+        } else if (!stop_reason_.empty()) {
+          finish(false, stop_reason_ + "; " + r.result->message, task->is_canceling());
+        } else {
+          on_result(r);
+        }
+      };
+    client->async_send_goal(goal, options);
+  }
+
   void observe()
   {
     Named::Goal goal;
     goal.target = observation_target_;
-    phase_ = Phase::OBSERVING;
-    cancel_sent_ = false;
-    const auto task = task_;
-    rclcpp_action::Client<Named>::SendGoalOptions options;
-    options.goal_response_callback = [this, task](NamedHandle::SharedPtr handle) {
-        if (task_ != task) { return; }
-        if (!handle) {
-          finish(false, "Observation motion rejected", task->is_canceling());
-        } else {
-          active_named_ = handle;
-        }
-      };
-    options.result_callback = [this, task](const NamedHandle::WrappedResult & result) {
-        if (task_ != task) { return; }
-        active_named_.reset();
-        if (task->is_canceling()) {
+    RCLCPP_INFO(get_logger(), "Moving to observation target: %s", observation_target_.c_str());
+    sendGoal(named_client_, goal, "Observation motion", [this](const auto & result) {
+        if (task_->is_canceling()) {
           finish(false, "Sorting canceled after observation motion", true);
         } else if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result->success) {
           finish(false, "Observation motion failed: " + result.result->message);
         } else {
-          needs_observation_ = false;
-          observations_.reset();
-          observations_after_ = now() + rclcpp::Duration::from_seconds(settle_time_);
-          waiting_since_ = std::chrono::steady_clock::now();
-          phase_ = Phase::WAITING;
-          waiting_reason_.clear();
+          awaitObservations();
         }
-      };
-    RCLCPP_INFO(get_logger(), "Moving to observation target: %s", observation_target_.c_str());
-    named_client_->async_send_goal(goal, options);
+      });
   }
 
   void dispatch(const Object & object)
@@ -314,69 +388,66 @@ private:
     goal.place_pose.pose.position.z = place.z();
     goal.place_pose.pose.orientation = object.pose.orientation;
     feedback(object.object_id);
-    phase_ = Phase::SENDING;
-    cancel_sent_ = false;
-    const auto task = task_;
-    rclcpp_action::Client<Pick>::SendGoalOptions options;
-    options.goal_response_callback = [this, task](PickHandle::SharedPtr handle) {
-        if (task_ != task) { return; }
-        if (!handle) {
-          finish(false, "PickPlace rejected the target", task->is_canceling());
-          return;
-        }
-        active_pick_ = handle;
-        phase_ = Phase::EXECUTING;
-      };
-    options.result_callback = [this, task, id = object.object_id](const PickHandle::WrappedResult & r) {
-        if (task_ != task) { return; }
-        active_pick_.reset();
+    sendGoal(pick_client_, goal, "PickPlace", [this, id = object.object_id](const auto & r) {
         const bool success = r.code == rclcpp_action::ResultCode::SUCCEEDED && r.result->success;
+        const bool unavailable = r.code == rclcpp_action::ResultCode::ABORTED &&
+          r.result->error_code == Pick::Result::TARGET_UNAVAILABLE;
+        if (success || unavailable) {pending_.erase(id);}
+        if (unavailable) {
+          unavailable_[id] = r.result->message;
+          RCLCPP_WARN(get_logger(), "Skipping unavailable target %s: %s",
+            id.c_str(), r.result->message.c_str());
+        }
         if (success) {
-          pending_.erase(id);
           ++completed_;
           feedback(id);
         }
-        if (task->is_canceling()) {
+        if (task_->is_canceling()) {
           finish(false, "Sorting canceled after active PickPlace returned", true);
-        } else if (!success) {
+        } else if (!success && !unavailable) {
           finish(false, "PickPlace failed for " + id + ": " + r.result->message);
         } else if (pending_.empty()) {
-          finish(true, "Batch motion sequences completed; placement needs visual verification");
+          finish(true, "Batch processing finished; completed=" + std::to_string(completed_) +
+            "; placement needs visual verification");
         } else {
-          phase_ = Phase::WAITING;
-          needs_observation_ = !observation_target_.empty();
-          waiting_since_ = std::chrono::steady_clock::now();
-          waiting_reason_.clear();
+          awaitObservations(!observation_target_.empty());
         }
-      };
-    pick_client_->async_send_goal(goal, options);
+      });
   }
 
   void tick()
   {
     if (!task_) { return; }
-    if (task_->is_canceling()) {
+    const auto clock_now = std::chrono::steady_clock::now();
+    if (phase_ != Phase::WAITING) {
+      const bool accepted = phase_ == Phase::EXECUTING;
+      const double limit = accepted ? execution_timeout_ : response_timeout_;
+      if (stop_reason_.empty() &&
+        std::chrono::duration<double>(clock_now - phase_since_).count() >= limit)
+      {
+        stop_reason_ = accepted ? "Action execution timed out" : "Action response timed out";
+      }
+    }
+    if (task_->is_canceling() || !stop_reason_.empty()) {
       if (phase_ == Phase::WAITING) {
         finish(false, "Sorting canceled before next pick", true);
-      } else if (active_pick_ && !cancel_sent_) {
+        return;
+      }
+      if (stop_reason_.empty()) {stop_reason_ = "Sorting cancellation requested";}
+      if (!stop_since_) {stop_since_ = clock_now;}
+      if (cancel_active_ && !cancel_sent_) {
         cancel_sent_ = true;
-        pick_client_->async_cancel_goal(active_pick_);
-      } else if (active_named_ && !cancel_sent_) {
-        cancel_sent_ = true;
-        named_client_->async_cancel_goal(active_named_);
+        cancel_active_();
+      }
+      if (std::chrono::duration<double>(clock_now - *stop_since_).count() >= cancel_timeout_) {
+        execution_unknown_ = true;
+        finish(false, stop_reason_ + "; final result missing, new tasks blocked until recovery",
+          task_->is_canceling());
       }
       return;
     }
     if (phase_ != Phase::WAITING) { return; }
     try {
-      if (!camera_frame_.empty()) {
-        const auto transform = tf_buffer_.lookupTransform(frame_, camera_frame_, tf2::TimePointZero);
-        const auto stamp = rclcpp::Time(transform.header.stamp, get_clock()->get_clock_type());
-        const double age = (now() - stamp).seconds();
-        if (stamp.nanoseconds() == 0 || age < -0.1 || age > camera_tf_max_age_) {
-          throw std::runtime_error("Required camera TF is stale");
-        }
-      }
       if (needs_observation_) {
         if (!named_client_->action_server_is_ready()) {
           waiting("Waiting for observation motion server");
@@ -403,12 +474,15 @@ private:
           return;
         }
       }
-      const auto objects = objectsInBase();
+      auto objects = objectsInBase();
+      std::set<uint8_t> observed_colors;
+      for (const auto & object : objects) {observed_colors.insert(object.color);}
+      filterRegion(objects);
       if (!batch_ready_) {
         for (const auto color : order_) {
-          if (std::none_of(objects.begin(), objects.end(),
-            [color](const auto & object) { return object.color == color; }))
-          {
+          // A visible but excluded color must not block eligible colors. A color
+          // never observed still uses the existing bounded observation wait.
+          if (observed_colors.count(color) == 0) {
             waiting("Waiting for requested color " + std::to_string(color));
             return;
           }
@@ -423,6 +497,10 @@ private:
           }
         }
         batch_ready_ = true;
+      }
+      if (pending_.empty()) {
+        finish(completed_ > 0, "No remaining objects inside grasp region");
+        return;
       }
       std::vector<Object> candidates;
       for (const auto & object : objects) {
@@ -450,6 +528,7 @@ private:
     } catch (const tf2::TransformException & error) {
       waiting("Waiting for TF: " + std::string(error.what()));
     } catch (const std::exception & error) {
+      if (phase_ != Phase::WAITING) {execution_unknown_ = true;}
       finish(false, error.what());
     }
   }
@@ -465,21 +544,29 @@ private:
   rclcpp::Time last_received_{0, 0, RCL_ROS_TIME};
   rclcpp::Time observations_after_{0, 0, RCL_ROS_TIME};
   std::shared_ptr<SortHandle> task_;
-  PickHandle::SharedPtr active_pick_;
-  NamedHandle::SharedPtr active_named_;
+  std::function<void()> cancel_active_;
   std::string observation_target_;
-  std::string frame_, tool_frame_, camera_frame_, default_strategy_, strategy_, waiting_reason_;
+  std::string frame_, tool_frame_, default_strategy_, strategy_, waiting_reason_;
   tf2::Vector3 tool_to_tcp_;
+  tf2::Vector3 region_min_, region_max_;
   std::array<tf2::Vector3, 4> places_;
   std::array<bool, 3> place_relative_axes_{};
   std::vector<uint8_t> default_order_, order_;
   std::map<std::string, uint8_t> pending_;
-  double max_age_, timeout_, settle_time_, camera_tf_max_age_;
+  std::map<std::string, std::string> unavailable_;
+  std::set<std::string> skipped_;
+  double max_age_, timeout_, settle_time_;
+  double response_timeout_, execution_timeout_, cancel_timeout_;
   uint32_t completed_ = 0;
   bool busy_ = false, batch_ready_ = false, cancel_sent_ = false;
   bool needs_observation_ = false, one_per_color_ = false;
+  bool execution_unknown_ = false;
+  bool filter_region_ = false;
+  std::string stop_reason_;
   Phase phase_ = Phase::WAITING;
   std::chrono::steady_clock::time_point waiting_since_;
+  std::chrono::steady_clock::time_point phase_since_;
+  std::optional<std::chrono::steady_clock::time_point> stop_since_;
 };
 
 int main(int argc, char ** argv)

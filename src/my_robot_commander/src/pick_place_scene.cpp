@@ -31,6 +31,15 @@ moveit_msgs::msg::CollisionObject box(
   {
     throw std::invalid_argument("Collision box dimensions must be three positive finite values");
   }
+  const auto & p = pose.pose.position;
+  const auto & q = pose.pose.orientation;
+  if (pose.header.frame_id.empty() || !std::isfinite(p.x) || !std::isfinite(p.y) ||
+    !std::isfinite(p.z) || !std::isfinite(q.x) || !std::isfinite(q.y) ||
+    !std::isfinite(q.z) || !std::isfinite(q.w) ||
+    std::abs(std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w)) - 1.0) > 1e-3)
+  {
+    throw std::invalid_argument("Collision box requires a finite pose and unit quaternion");
+  }
   moveit_msgs::msg::CollisionObject object;
   object.id = id;
   object.header = pose.header;
@@ -77,7 +86,10 @@ PickPlaceScene::PickPlaceScene(
     const auto size = parameter<std::vector<double>>(node_, prefix + ".size", {2.0, 2.0, 0.02});
     const auto xyz = parameter<std::vector<double>>(node_, prefix + ".position", {0.0, 0.0, -0.01});
     const auto rpy = parameter<std::vector<double>>(node_, prefix + ".rpy", {0.0, 0.0, 0.0});
-    if (xyz.size() != 3 || rpy.size() != 3) {
+    if (xyz.size() != 3 || rpy.size() != 3 ||
+      !std::all_of(xyz.begin(), xyz.end(), [](double v) {return std::isfinite(v);}) ||
+      !std::all_of(rpy.begin(), rpy.end(), [](double v) {return std::isfinite(v);}))
+    {
       throw std::invalid_argument("Collision box position/rpy must have three values");
     }
     geometry_msgs::msg::PoseStamped pose;
@@ -129,19 +141,25 @@ void PickPlaceScene::sync(
   auto update = diff();
   std::set<std::string> observed;
   for (const auto & object : observations->objects) {
-    validateObjectId(object.object_id);
-    if (object.object_id == held_id_) {continue;}
-    geometry_msgs::msg::PoseStamped pose;
-    pose.header = observations->header;
-    pose.pose = object.pose;
-    if (pose.header.frame_id != frame_) {
-      pose = tf_.transform(pose, frame_, tf2::durationFromSec(0.1));
+    try {
+      validateObjectId(object.object_id);
+      if (object.object_id == held_id_) {continue;}
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header = observations->header;
+      pose.pose = object.pose;
+      if (pose.header.frame_id != frame_) {
+        pose = tf_.transform(pose, frame_, tf2::durationFromSec(0.1));
+      }
+      update.world.collision_objects.push_back(
+        box(
+          object.object_id, pose,
+          {object.dimensions.x, object.dimensions.y, object.dimensions.z}));
+      observed.insert(object.object_id);
+    } catch (const std::invalid_argument & error) {
+      // Keep any previous obstacle; one malformed observation cannot replace it.
+      RCLCPP_WARN(node_->get_logger(), "Ignoring invalid scene object '%s': %s",
+        object.object_id.c_str(), error.what());
     }
-    update.world.collision_objects.push_back(
-      box(
-        object.object_id, pose,
-        {object.dimensions.x, object.dimensions.y, object.dimensions.z}));
-    observed.insert(object.object_id);
   }
   if (!update.world.collision_objects.empty()) {
     apply(update);

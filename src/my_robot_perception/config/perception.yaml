@@ -19,13 +19,16 @@ color_detector:
 
     # OpenCV HSV：H=0~179，S/V=0~255。
     # H 下界大于上界表示跨越色相零点，适用于红色。
-    red.lower: [170, 100, 50]
-    red.upper: [10, 255, 255]
-    green.lower: [35, 80, 50]
-    green.upper: [85, 255, 255]
-    # 原始 RGB 中蓝色杯盖实测 S 约84；保持原 S 下限80，避免漏掉正面。
-    blue.lower: [90, 80, 70]
-    blue.upper: [135, 255, 255]
+    # 当前红/绿/蓝方块的实测起点：收窄 H，排除低饱和度与暗背景。
+    # 当前光照下顶面 HSV 中位数约 [179,220,167] / [56,144,121] / [106,218,133]。
+    # 绿色 S 保留至110以覆盖较浅区域；此配置不再兼容原 S≈84 的蓝色杯盖。
+    # 光照/曝光变化后需重新采样；同色背景不能仅凭 HSV 区分。
+    red.lower: [174, 150, 100]
+    red.upper: [6, 255, 255]
+    green.lower: [45, 110, 70]
+    green.upper: [75, 255, 255]
+    blue.lower: [100, 140, 80]
+    blue.upper: [125, 255, 255]
 
 depth_localizer:
   ros__parameters:
@@ -42,10 +45,10 @@ depth_localizer:
     # 中心模型适用于已知尺寸、平放且轴与 objects_frame 对齐的单色箱体。
     # 深度估计顶面，RGB 箱体轮廓补偿斜视侧面；不是任意遮挡物体的 6D 位姿估计。
     object_dimensions: [0.05, 0.05, 0.05]  # 当前实物方块 50 mm；更换物体时同步修改
-    top_surface_tolerance: 0.002 # 上部点的高度容差，m；要求物块平放且顶部可见
-    tf_timeout: 0.1              # s，等待采集时刻的 TF 到达，避免图像略早于关节 TF
+    top_surface_tolerance: 0.004 # 顶面高度带半宽，m；平面内点另加实测噪声容差
+    tf_timeout: 0.3              # s，等待采集时刻的 TF；不使用最新 TF 替代
     sync_slop: 0.03               # RGB 标签与深度时间差上限，单位 s
-    input_timeout: 1.0            # 无匹配输入时发布空观测，禁止沿用旧坐标
+    input_timeout: 3.0            # s，连续无配对输入后发布空观测；恢复后自动继续
     surface_separation: 0.005      # 前景边界判定的平面距离下限，另加测得的表面噪声，m
     min_depth: 0.05               # 单位 m
     max_depth: 3.0

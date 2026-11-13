@@ -30,6 +30,7 @@
   <exec_depend>topic_tools</exec_depend>
   <exec_depend>agx_arm_description</exec_depend>
   <exec_depend>agx_arm_ctrl</exec_depend>
+  <exec_depend>my_robot_hardware</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>

@@ -24,7 +24,7 @@ from _moveit_config_builder import (
 )
 
 
-def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace):
+def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace, real=False):
     """Build ros2_controllers config and return path to a temporary YAML file."""
     arm_joints = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
     if arm_type == "nero":
@@ -75,6 +75,7 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
         cm_controllers[ctrl_name] = {
             "type": "joint_trajectory_controller/JointTrajectoryController",
         }
+
         config[cm_node]["ros__parameters"].update(cm_controllers)
         config[(f"/{ns}/{ctrl_name}" if ns else f"/{ctrl_name}")] = {
             "ros__parameters": {
@@ -91,6 +92,20 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
                 "state_interfaces": ["position", "velocity"],
             },
         }
+
+    if real:
+        gripper_goal_tolerance = 0.0  # Fixed local value in m; 0 disables position goal checks.
+        # Arm goals retain measured-position checks. Zero disables only the
+        # gripper's position goal check; command completion is not proof of grasp.
+        for name, item in config.items():
+            params = item['ros__parameters']
+            if 'joints' not in params:
+                continue
+            tolerance = gripper_goal_tolerance if name.endswith('/gripper_controller') else 0.01
+            params['constraints'] = {
+                'goal_time': 3.0, 'stopped_velocity_tolerance': 0.05,
+                **{joint: {'goal': tolerance} for joint in params['joints']},
+            }
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", prefix="ros2_controllers_", delete=False
@@ -196,7 +211,8 @@ def _build_moveit(context):
     )
 
     ros2_controllers_yaml = _build_ros2_controllers_file(
-        arm_type, effector_type, revo2_type, namespace
+        arm_type, effector_type, revo2_type, namespace,
+        real=LaunchConfiguration('follow').perform(context) == 'true',
     )
     actions.append(
         Node(
@@ -206,7 +222,10 @@ def _build_moveit(context):
                 moveit_config.robot_description,
                 ros2_controllers_yaml,
             ],
-            remappings=[("joint_states", "control/joint_states")],
+            # In real mode only the hardware adapter publishes official commands.
+            remappings=[("joint_states", "controller_joint_states" if
+                         LaunchConfiguration('follow').perform(context) == 'true' else
+                         "control/joint_states")],
         )
     )
 

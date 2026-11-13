@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start the three-layer stack and submit the existing sorting action.
+# Start the stack, sort, then return to the named pose configured in startup.yaml.
+# export ROS_DOMAIN_ID=189
 set -euo pipefail
 workspace="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 config="$workspace/config/three_material_grasp/startup.yaml"
@@ -10,6 +11,7 @@ fi
 [[ "$config" = /* ]] || config="$workspace/$config"
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     echo 'Usage: bash script/three_material_grasp.sh [--config PATH] [--dry-run]'
+    echo 'Set pre_grasp_target and post_grasp_target in the selected YAML (default return: home).'
     exit 0
 fi
 ros_distro=$(/usr/bin/python3 "$workspace/script/build/three_material_grasp.py" \
