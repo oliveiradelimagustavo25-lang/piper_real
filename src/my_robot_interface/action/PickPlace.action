@@ -16,12 +16,8 @@ geometry_msgs/PoseStamped place_pose
 # Result：执行结果；最终是否进入颜色分拣区域由任务节点另行视觉验证。
 bool success
 string message
-# 只报告失败性质；不是新的抓取前置条件。
-uint8 NONE=0
-uint8 TARGET_UNAVAILABLE=1   # 接触前的输入/规划失败，未下发失败阶段的轨迹
-uint8 EXECUTION_FAILED=2    # 轨迹执行失败，停止后续任务
-uint8 RECOVERY_REQUIRED=3   # 可能持物或执行状态不明，需要显式恢复
-uint8 error_code
+# 只报告失败事实，不增加抓取前置条件；错误码见 Failure.msg。
+my_robot_interface/Failure failure
 ---
 # Feedback：只报告主要阶段，完成或失败通过 Result 返回。
 uint8 PREPARING=0     # 检查目标、准备规划场景

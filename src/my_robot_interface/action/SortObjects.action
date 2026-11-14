@@ -7,6 +7,8 @@ uint8[] color_order
 # 表示本批 PickPlace 运动流程完成，实际放置仍需视觉复核。
 bool success
 string message
+uint32 completed_count
+my_robot_interface/Failure[] failures
 ---
 string current_object_id
 uint32 completed_count

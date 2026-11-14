@@ -4,11 +4,14 @@
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
+#include <my_robot_interface/failure_policy.hpp>
 
 #include <moveit/collision_detection/collision_matrix.h>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+namespace policy = my_robot_interface::failure;
 
 namespace my_robot_commander
 {
@@ -111,7 +114,9 @@ moveit_msgs::msg::AllowedCollisionMatrix PickPlaceScene::collisionMatrix()
 {
   using namespace std::chrono_literals;
   if (!get_scene_->wait_for_service(5s)) {
-    throw std::runtime_error("MoveIt planning scene service unavailable");
+    throw policy::Error(policy::makeFailure(
+      policy::Failure::DEPENDENCY_UNAVAILABLE,
+      policy::Failure::SCENE, "MoveIt planning scene service unavailable"));
   }
   auto request = std::make_shared<moveit_msgs::srv::GetPlanningScene::Request>();
   request->components.components =
@@ -119,7 +124,9 @@ moveit_msgs::msg::AllowedCollisionMatrix PickPlaceScene::collisionMatrix()
   auto result = get_scene_->async_send_request(request);
   if (result.wait_for(5s) != std::future_status::ready) {
     get_scene_->remove_pending_request(result);
-    throw std::runtime_error("Planning scene query timed out");
+    throw policy::Error(policy::makeFailure(
+      policy::Failure::DEPENDENCY_UNAVAILABLE,
+      policy::Failure::SCENE, "Planning scene query timed out"));
   }
   return result.get()->scene.allowed_collision_matrix;
 }
@@ -127,7 +134,9 @@ moveit_msgs::msg::AllowedCollisionMatrix PickPlaceScene::collisionMatrix()
 void PickPlaceScene::apply(const moveit_msgs::msg::PlanningScene & update)
 {
   if (!scene_.applyPlanningScene(update)) {
-    throw std::runtime_error("MoveIt rejected the planning scene update");
+    throw policy::Error(policy::makeFailure(
+      policy::Failure::SCENE_INCONSISTENT,
+      policy::Failure::SCENE, "MoveIt planning scene update was not confirmed"));
   }
 }
 
@@ -139,6 +148,11 @@ void PickPlaceScene::sync(
   const double age = (node_->now() - stamp).seconds();
   if (stamp.nanoseconds() != 0 && (age < -0.1 || age > 2.0)) {return;}
   auto update = diff();
+  geometry_msgs::msg::TransformStamped transform;
+  if (observations->header.frame_id != frame_) {
+    transform = tf_.lookupTransform(frame_, observations->header.frame_id, stamp,
+      tf2::durationFromSec(0.1));
+  }
   std::set<std::string> observed;
   for (const auto & object : observations->objects) {
     try {
@@ -148,7 +162,9 @@ void PickPlaceScene::sync(
       pose.header = observations->header;
       pose.pose = object.pose;
       if (pose.header.frame_id != frame_) {
-        pose = tf_.transform(pose, frame_, tf2::durationFromSec(0.1));
+        geometry_msgs::msg::PoseStamped converted;
+        tf2::doTransform(pose, converted, transform);
+        pose = converted;
       }
       update.world.collision_objects.push_back(
         box(
@@ -205,14 +221,20 @@ void PickPlaceScene::attach()
   auto update = diff();
   // MoveIt 在附着 ADD 时自动从世界移除同名物体。
   update.robot_state.attached_collision_objects.push_back(attached);
+  held_id_ = target_id_;  // Retain the ID even if the update result is lost.
   apply(update);
-  held_id_ = target_id_;
 }
 
 void PickPlaceScene::release()
 {
   const auto attached = scene_.getAttachedObjects({held_id_});
-  auto object = attached.at(held_id_).object;
+  const auto found = attached.find(held_id_);
+  if (found == attached.end()) {
+    throw policy::Error(policy::makeFailure(
+      policy::Failure::SCENE_INCONSISTENT, policy::Failure::SCENE,
+      "Expected attached object is missing: " + held_id_));
+  }
+  auto object = found->second.object;
   geometry_msgs::msg::PoseStamped pose;
   pose.header = object.header;
   pose.header.stamp = builtin_interfaces::msg::Time();
@@ -222,7 +244,7 @@ void PickPlaceScene::release()
   object.pose = pose.pose;
   object.operation = object.ADD;
   auto update = diff();
-  auto remove = attached.at(held_id_);
+  auto remove = found->second;
   remove.object.operation = remove.object.REMOVE;
   update.robot_state.attached_collision_objects.push_back(remove);
   update.world.collision_objects.push_back(object);

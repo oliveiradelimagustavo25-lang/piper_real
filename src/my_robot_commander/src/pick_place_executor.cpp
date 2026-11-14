@@ -15,9 +15,11 @@
 #include <my_robot_interface/action/pick_place.hpp>
 #include <my_robot_interface/action/move_to_named.hpp>
 #include <my_robot_interface/msg/detected_object_array.hpp>
+#include <my_robot_interface/failure_policy.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2/LinearMath/Matrix3x3.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -26,6 +28,8 @@
 
 #include "my_robot_commander/motion_controller.hpp"
 #include "my_robot_commander/pick_place_scene.hpp"
+
+namespace policy = my_robot_interface::failure;
 
 namespace
 {
@@ -84,6 +88,8 @@ class PickPlaceExecutor
   using NamedHandle = rclcpp_action::ServerGoalHandle<NamedAction>;
   using Motion = my_robot_commander::MotionController;
   using Scene = my_robot_commander::PickPlaceScene;
+  using Failure = policy::Failure;
+  using FailureError = policy::Error;
   // Attached is a planning state, not a physical grasp-confirmation signal.
   enum class GraspState {Empty, NeedsRecovery, Attached, Released};
 
@@ -144,17 +150,33 @@ public:
     }
     const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::duration<double>(startup_timeout);
-    while (!planning_scene->wait_for_service(std::chrono::seconds(1))) {
+    std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> descriptions;
+    for (const std::string name : {"robot_description", "robot_description_semantic"}) {
+      if (parameter<std::string>(node_, name, "").empty()) {
+        descriptions.push_back(node_->create_subscription<std_msgs::msg::String>(
+          name, rclcpp::QoS(1).transient_local(),
+          [node = node_, name](std_msgs::msg::String::ConstSharedPtr message) {
+            if (!message->data.empty()) {node->set_parameter(rclcpp::Parameter(name, message->data));}
+          }));
+      }
+    }
+    while (!planning_scene->wait_for_service(std::chrono::seconds(1)) ||
+      node_->get_parameter("robot_description").as_string().empty() ||
+      node_->get_parameter("robot_description_semantic").as_string().empty())
+    {
       if (!rclcpp::ok()) {
         throw std::runtime_error("Shutdown while waiting for MoveIt");
       }
       if (std::chrono::steady_clock::now() >= deadline) {
-        throw std::runtime_error("Timed out waiting for get_planning_scene; start the control layer");
+        throw std::runtime_error("Timed out waiting for MoveIt scene/model; start the control layer");
       }
       RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 5000,
-        "Waiting for control stack: get_planning_scene");
+        "Waiting for control stack: planning scene and robot model");
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    options.startup_timeout = std::max(0.001,
+      std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count());
     motion_ = std::make_unique<Motion>(node_, options);
     motion_->validateLinks({options.end_effector_link});
     const auto touch_links = parameter<std::vector<std::string>>(
@@ -183,7 +205,7 @@ public:
     server_ = rclcpp_action::create_server<Action>(
       node_, name,
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const Action::Goal> goal) {
-        if (busy_ || !validGoal(*goal) || grasp_state_ != GraspState::Empty ||
+        if (busy_ || !scene_ready_ || !validGoal(*goal) || grasp_state_ != GraspState::Empty ||
           !motion_->executionStateKnown() || busy_.exchange(true))
         {
           RCLCPP_WARN(node_->get_logger(), "Rejected invalid/busy goal or pending grasp recovery");
@@ -206,7 +228,7 @@ public:
       node_,
       parameter<std::string>(node_, "move_to_named_action", "/manipulation/move_to_named"),
       [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const NamedAction::Goal> goal) {
-        if (busy_ || goal->target.empty() || grasp_state_ == GraspState::NeedsRecovery ||
+        if (busy_ || !scene_ready_ || goal->target.empty() || grasp_state_ == GraspState::NeedsRecovery ||
           grasp_state_ == GraspState::Released || !motion_->executionStateKnown() || busy_.exchange(true))
         {
           return rclcpp_action::GoalResponse::REJECT;
@@ -248,6 +270,7 @@ public:
           if (scene_->holding()) {scene_->release();}
           scene_->restoreTouch();
           grasp_state_ = GraspState::Empty;
+          scene_ready_ = true;
           response->success = true;
           response->message = "Gripper opened; planning-scene attachment released";
         } catch (const std::exception & error) {
@@ -306,6 +329,20 @@ private:
     scene_->sync(observations);
   }
 
+  Failure snapshot(Failure failure, uint8_t stage, const std::string & id = "")
+  {
+    failure.stage = stage;
+    failure.object_id = id;
+    if (failure.origin != Failure::MOTION) {
+      failure.command_state = motion_->executionStateKnown() ? Failure::NOT_SENT : Failure::UNKNOWN;
+    }
+    const auto grasp = grasp_state_.load();
+    failure.payload_state = (grasp == GraspState::Empty || grasp == GraspState::Released) ?
+      Failure::CLEAR : Failure::MAY_HOLD;
+    failure.scene_state = scene_ready_ ? Failure::CONSISTENT : Failure::UNCERTAIN;
+    return failure;
+  }
+
   void executeNamed(const std::shared_ptr<NamedHandle> & handle)
   {
     auto result = std::make_shared<NamedAction::Result>();
@@ -313,16 +350,29 @@ private:
       syncScene();
       if (!handle->is_canceling()) {
         result->success = motion_->moveToNamedTarget(handle->get_goal()->target);
+        result->failure = motion_->lastFailure();
+      } else {
+        result->failure = policy::makeFailure(
+          Failure::EXECUTION_FAILED, Failure::EXECUTOR, "Canceled before named motion");
       }
-      result->message = result->success ? "Named target reached" :
-        "Named motion failed: " + motion_->lastError();
+    } catch (const FailureError & error) {
+      result->failure = error.failure;
+    } catch (const tf2::TransformException & error) {
+      result->failure = policy::makeFailure(Failure::TF_UNAVAILABLE, Failure::SCENE, error.what());
     } catch (const std::exception & error) {
-      result->message = error.what();
+      result->failure = policy::makeFailure(Failure::UNCLASSIFIED, Failure::EXECUTOR, error.what());
     }
+    if (result->failure.code == Failure::SCENE_INCONSISTENT) {scene_ready_ = false;}
+    result->failure = snapshot(result->failure, Failure::PLAN);
+    result->message = result->success ? "Named target reached" : result->failure.detail;
     if (rclcpp::ok()) {
       if (handle->is_canceling()) {
         result->success = false;
-        result->message = "Named motion cancellation completed; verify physical state before recovery";
+        if (result->failure.code == Failure::NONE) {
+          result->failure.code = Failure::EXECUTION_FAILED;
+          result->failure.detail = "Named motion cancellation completed";
+          result->message = result->failure.detail;
+        }
         handle->canceled(result);
       } else if (result->success) {
         handle->succeed(result);
@@ -368,7 +418,7 @@ private:
   void execute(const std::shared_ptr<GoalHandle> & handle)
   {
     auto result = std::make_shared<Action::Result>();
-    result->error_code = Action::Result::TARGET_UNAVAILABLE;
+    uint8_t current_stage = Failure::VALIDATE;
     auto feedback = std::make_shared<Action::Feedback>();
     const auto stage = [&](uint8_t value, const std::string & message) {
         feedback->stage = value;
@@ -378,17 +428,18 @@ private:
           handle->publish_feedback(feedback);
         }
       };
-    const auto step = [&](const std::string & name, const std::function<bool()> & operation) {
+    const auto step = [&](const std::string & name, uint8_t value,
+        const std::function<bool()> & operation) {
+        current_stage = value;
         if (interrupted(handle)) {
-          throw std::runtime_error("Canceled before " + name);
+          throw FailureError(policy::makeFailure(
+            Failure::EXECUTION_FAILED, Failure::EXECUTOR, "Canceled before " + name));
         }
         stage(feedback->stage, name);
-        result->error_code = Action::Result::EXECUTION_FAILED;
         if (!operation()) {
-          if (motion_->lastFailureBeforeExecution()) {
-            result->error_code = Action::Result::TARGET_UNAVAILABLE;
-          }
-          throw std::runtime_error(name + " failed: " + motion_->lastError());
+          auto failure = motion_->lastFailure();
+          failure.detail = name + " failed: " + failure.detail;
+          throw FailureError(failure);
         }
       };
     const auto move = [&](const tf2::Vector3 & tcp, bool cartesian) {
@@ -408,14 +459,20 @@ private:
       if (stamp.nanoseconds() != 0 && max_age_ > 0) {
         const double age = (node_->now() - stamp).seconds();
         if (age < -0.1 || age > max_age_) {
-          throw std::runtime_error("Object observation is stale or uses a different clock");
+          auto failure = policy::makeFailure(Failure::OBSERVATION_STALE,
+            Failure::EXECUTOR, "Object observation is stale or uses a different clock");
+          failure.target_specific = true;
+          throw FailureError(failure);
         }
       }
       const auto object = inBase(goal->object_pose);
       const auto place = inBase(goal->place_pose);
       const double width = graspWidth(object.pose, goal->object_dimensions, tool_rotation_);
       if (width + 2 * pad_thickness_ >= open_width_) {
-        throw std::runtime_error("Object is wider than the clear opening between gripper pads");
+        auto failure = policy::makeFailure(
+          Failure::TARGET_UNAVAILABLE, Failure::EXECUTOR, "Object is wider than the clear opening between gripper pads");
+        failure.target_specific = true;
+        throw FailureError(failure);
       }
       const tf2::Vector3 pick = tf2::Vector3(
         object.pose.position.x,
@@ -428,25 +485,28 @@ private:
       tf2::fromMsg(object.pose.orientation, object_q);
       tf2::fromMsg(place.pose.orientation, place_q);
       if (object_q.angleShortestPath(place_q) > 0.01) {
-        throw std::runtime_error("This executor requires matching pick/place object orientation");
+        auto failure = policy::makeFailure(
+          Failure::TARGET_UNAVAILABLE, Failure::EXECUTOR, "This executor requires matching pick/place object orientation");
+        failure.target_specific = true;
+        throw FailureError(failure);
       }
       const auto pre_pick = pick + tf2::Vector3(0, 0, approach_);
-      const double safe_z = std::max({transport_z_, pick.z() + lift_, put.z() + retreat_});
+      const double minimum_z = std::max(pick.z() + lift_, put.z() + retreat_);
+      const double safe_z = std::max(transport_z_, minimum_z);
       // Lift the requested clearance vertically; reach transport height during
       // the subsequent collision-checked transfer, not at maximum reach.
       const tf2::Vector3 lifted(pick.x(), pick.y(), pick.z() + lift_);
-      const tf2::Vector3 pre_place(put.x(), put.y(), safe_z);
 
-      result->error_code = Action::Result::EXECUTION_FAILED;
+      current_stage = Failure::PREPARE;
       syncScene();
       scene_->prepare(goal->object_id, object, goal->object_dimensions);
 
       stage(Action::Feedback::PICKING, "Opening, approaching and gripping " + goal->object_id);
-      step("Open gripper", [&]() {return grip(open_width_);});
-      step("Move to pre-grasp", [&]() {return move(pre_pick, false);});
-      step("Descend to grasp", [&]() {return move(pick, true);});
+      step("Open gripper", Failure::OPEN, [&]() {return grip(open_width_);});
+      step("Move to pre-grasp", Failure::PREGRASP, [&]() {return move(pre_pick, false);});
+      step("Descend to grasp", Failure::DESCEND, [&]() {return move(pick, true);});
       step(
-        "Close gripper", [&]() {
+        "Close gripper", Failure::CLOSE, [&]() {
           // A failed/partial close can still contact an object. Never silently
           // mark it empty or attach before the close command has completed.
           grasp_state_ = GraspState::NeedsRecovery;
@@ -454,50 +514,89 @@ private:
           RCLCPP_INFO(node_->get_logger(),
             "Close gripper: projected object %.1f mm, pad per side %.1f mm, compression %.1f mm -> target %.1f mm",
             width * 1000, pad_thickness_ * 1000, compression_ * 1000, target_width * 1000);
-          if (!grip(target_width)) {return false;}
+          if (!grip(target_width)) {
+            if (motion_->lastFailure().command_state == Failure::NOT_SENT) {
+              grasp_state_ = GraspState::Empty;  // Planning never reached contact.
+            }
+            return false;
+          }
           scene_->attach();
           grasp_state_ = GraspState::Attached;
           return true;
         });
 
       stage(Action::Feedback::TRANSFERRING, "Lifting and transferring");
-      step("Lift object", [&]() {return move(lifted, true);});
-      step("Transfer object", [&]() {return move(pre_place, false);});
+      step("Lift object", Failure::LIFT, [&]() {return move(lifted, true);});
+      step("Transfer object", Failure::TRANSFER, [&]() {
+          for (const double z : {safe_z, (safe_z + minimum_z) / 2, minimum_z}) {
+            if (move(tf2::Vector3(put.x(), put.y(), z), false)) {return true;}
+            const auto failure = motion_->lastFailure();
+            if (failure.code != Failure::PLAN_FAILED || failure.command_state != Failure::NOT_SENT ||
+              interrupted(handle) || z <= minimum_z + 1e-6)
+            {
+              return false;
+            }
+            RCLCPP_INFO(node_->get_logger(), "Transfer height %.3f m unavailable; trying a lower height", z);
+          }
+          return false;
+        });
 
       stage(Action::Feedback::PLACING, "Lowering, releasing and retreating");
-      step("Descend to place", [&]() {return move(put, true);});
+      step("Descend to place", Failure::PLACE, [&]() {return move(put, true);});
       step(
-        "Release object", [&]() {
+        "Release object", Failure::RELEASE, [&]() {
           if (!grip(open_width_)) {return false;}
           grasp_state_ = GraspState::Released;
           scene_->release();
           return true;
         });
-      step("Retreat", [&]() {return move(put + tf2::Vector3(0, 0, retreat_), true);});
+      step("Retreat", Failure::RETREAT, [&]() {return move(put + tf2::Vector3(0, 0, retreat_), true);});
       result->success = true;
       result->message = "Motion sequence completed; object placement needs visual verification";
+      result->failure = policy::makeFailure(Failure::NONE, Failure::EXECUTOR, "");
+    } catch (const FailureError & error) {
+      result->failure = error.failure;
+    } catch (const tf2::TransformException & error) {
+      result->failure = policy::makeFailure(
+        Failure::TF_UNAVAILABLE, Failure::SCENE, error.what());
+    } catch (const std::invalid_argument & error) {
+      result->failure = policy::makeFailure(Failure::INPUT_INVALID, Failure::EXECUTOR, error.what());
+      result->failure.target_specific = true;
     } catch (const std::exception & error) {
-      result->message = error.what();
-      RCLCPP_WARN(node_->get_logger(), "%s", error.what());
+      result->failure = policy::makeFailure(Failure::UNCLASSIFIED, Failure::EXECUTOR, error.what());
     }
+    if (result->failure.code == Failure::SCENE_INCONSISTENT) {scene_ready_ = false;}
     try {
       scene_->restoreTouch();
       if (grasp_state_ == GraspState::Released && !scene_->holding()) {
         grasp_state_ = GraspState::Empty;
       }
     } catch (const std::exception & error) {
-      // A completed release remains known even if collision cleanup must retry.
-      if (grasp_state_ != GraspState::Released) {grasp_state_ = GraspState::NeedsRecovery;}
+      scene_ready_ = false;
+      if (result->success) {
+        current_stage = Failure::CLEANUP;
+        result->failure = policy::makeFailure(
+          Failure::SCENE_INCONSISTENT, Failure::SCENE, error.what());
+      } else {
+        result->failure.detail += "; restoring collision checks failed: " + std::string(error.what());
+      }
       result->success = false;
-      result->message += "; restoring collision checks failed: " + std::string(error.what());
     }
-    if (result->success) {result->error_code = Action::Result::NONE;} else if (
-      grasp_state_ != GraspState::Empty || !motion_->executionStateKnown())
-    {result->error_code = Action::Result::RECOVERY_REQUIRED;}
+    result->failure = snapshot(result->failure, current_stage, handle->get_goal()->object_id);
+    if (!result->success) {
+      result->message = result->failure.detail;
+      const auto decision = policy::decideStep(result->failure);
+      RCLCPP_WARN(node_->get_logger(), "PickPlace code=%u stage=%u decision=%u: %s",
+        result->failure.code, current_stage, static_cast<unsigned>(decision), result->message.c_str());
+    }
     if (rclcpp::ok()) {
       if (handle->is_canceling()) {
         result->success = false;
         result->message = "Cancellation handled; gripper state retained; " + result->message;
+        if (result->failure.code == Failure::NONE) {
+          result->failure.code = Failure::EXECUTION_FAILED;
+          result->failure.detail = result->message;
+        }
         if (grasp_state_ != GraspState::Empty) {result->message += "; explicit recovery required";}
         handle->canceled(result);
       } else if (result->success) {
@@ -529,6 +628,7 @@ private:
   std::thread worker_;
   std::atomic<bool> busy_{false};
   std::atomic<GraspState> grasp_state_{GraspState::Empty};
+  std::atomic<bool> scene_ready_{true};
   std::atomic<bool> cancel_requested_{false};
   std::string frame_;
   tf2::Vector3 tool_to_tcp_, offset_;

@@ -13,12 +13,12 @@
 | `src/agx_ros_control_moveit/` | AGX 机械臂驱动、机器人描述、MoveIt、控制器及 RViz 配置 |
 | `src/vidu_camera_wrapper/` | Vidu ROS 2 消息接口与相机采集节点，依赖外部 Vidu SDK |
 | `src/my_robot_perception/` | 原始 RGB 颜色分割、深度关联和 ArUco 检测节点 |
-| `src/my_robot_interface/` | 上层模块共用的消息与 Action 定义 |
+| `src/my_robot_interface/` | 共用消息、Action 与轻量失败处理规则，无独立运行节点 |
 | `src/my_robot_commander/` | MoveIt 运动封装、抓放执行器和碰撞场景管理 |
 | `src/my_robot_hardware/` | ros2_control 的官方 AGX 话题适配库，接收真实反馈并下发命令 |
 | `src/my_robot_planner/` | 根据感知对象组织分拣任务，调用执行层 Action |
 | `src/my_robot_bringup/` | 三个独立分层入口与总入口：控制、运动/行为规划、相机感知 |
-| `test/` | 五个按职责划分的 Python 测试入口，`native/` 保留实际 C++ 转换验证源 |
+| `test/` | 五个 Python 测试入口，`native/` 直接验证 C++ 转换和失败处理规则 |
 | `docs/` | 方案、集成缺口、实施说明和调试记录 |
 
 主要视觉数据流：
@@ -153,7 +153,7 @@ motion.closeGripper();                          // 官方 gripper_close，0 mm
 
 夹爪命名状态只保留官方 `gripper_open/gripper_half/gripper_close`，已移除新增的 `open/close` 别名。数值宽度不依赖命名状态，抓放 YAML 的 `gripper_open_width` 为 0.095 m，并按模型限位检查。独立关节 `gripper` 表示总开口，`gripper_joint1/2` 由模型 mimic 派生，不使用旧 `joint7/joint8` 手指向量。arm 保留 `pose_1/pose_2`；真实支架、桌面和运动路径仍需实物确认。
 
-接口长度为 m、角度为 rad；输入或规划/执行被拒时返回 false，配置及 ROS/MoveIt 异常可向调用者抛出，`lastError()` 提供最近的运动错误。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示轨迹执行成功；real 模式按真实关节反馈及配置容差判断，仍不证明绝对 TCP 精度或夹持成功。执行器会将取消请求传到 ExecuteTrajectory；取消结果未知时阻止后续运动，不等同于急停。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。
+接口长度为 m、角度为 rad；运动失败返回 false，`lastFailure()` 提供结构化原因，`lastError()` 保留文字查询兼容；构造和配置错误仍可抛出。位姿须带有效坐标系，笛卡尔目标须已转换到 `reference_frame`。同一实例串行执行；RViz 或其他进程的运动请求不受该实例的互斥保护，目前没有统一仲裁。返回 true 表示轨迹执行成功；real 模式按真实关节反馈及配置容差判断，仍不证明绝对 TCP 精度或夹持成功。执行器会将取消请求传到 ExecuteTrajectory；结果未知时保留 Goal，晚到终态可对账，但不自动续跑，不等同于急停。跨进程任务使用 `/sorting/sort_objects`、`/manipulation/pick_place`，已有 `/manipulation/move_to_named` 只控制 arm。
 
 抓放执行器在闭合命令成功后才附着模型；闭合不确定、附着失败或搬运失败时，不自动开爪或假定空手。`/manipulation/release_held_object` 是显式恢复接口，可能真实开爪，须先确认承托和现场状态。状态不确定时拒绝新抓取与命名运动；已附着的对象在运动失败后仍保留碰撞模型。
 
@@ -162,6 +162,8 @@ motion.closeGripper();                          // 官方 gripper_close，0 mm
 相机挂载 TF 留待手眼标定，未迁入参考项目的错误外参；缺机器人 TF 时，相机二维检测和相机系测量仍可独立工作，`base_link` 物体输出尚不完整。`tcp_offset` 默认零，执行器 `tool_to_tcp` 仍需实际核对。启动层不再管理 Octomap 开关；当前没有启用相机障碍输入，固定碰撞环境由中层管理。
 
 real 模式已改用 `my_robot_hardware/AgxTopicSystem`：`/feedback/joint_states` 写入真实状态接口，`/control/joint_states` 仅由适配器下发命令；广播器状态改发 `/controller_joint_states`，不再混入命令话题。启动先同步实际关节，缺失、过期或非法反馈不能激活；运行中反馈失效会停止发布并请求停用本系统的运动控制器，不自动恢复。mock 保留 GenericSystem。相关参数、故障恢复边界及验证见[链路可靠性修复记录](docs/control_reliability_repair.md)。本轮尚未复验真机，关节容差不代表实际 TCP 精度；本机 MoveIt 2.5.10 退出阶段段错误仍未解决，不能用自动重启掩盖。
+
+反馈门禁使用测量时间，瞬时 `hz=0` 不再单独拒绝控制；反馈保留原采集时间，不重盖当前时间。持续失效时，适配器通过 `control_stop`（Trigger）请求 SDK 电子停止，再检查相关控制器已经停用；服务成功只代表报文发送返回，物理停稳仍需现场验证。原 `emergency_stop`（Empty）共用此停止实现，不再切换 JS/普通关节模式。关节命令流超过 1 秒无新命令时也会请求停止；正常关闭控制门或切换显式运动命令会解除流监测。现有执行/场景恢复锁本轮未改。
 
 ## 视觉启动与参数
 
@@ -284,7 +286,7 @@ bash script/three_material_grasp.sh            # 启动后自动发送实际分�
 
 Planner 派发前检查新观测，短暂失测最多等待 15 s 恢复，观测最大年龄仍为 2 s；单条非法记录不影响其他有效目标。感知在图像采集时刻转换坐标，Planner/Executor 仅在输入坐标系需要转换时查询对应 TF，已在基座系的目标不额外依赖当前相机 TF。执行开始后按固定目标完成，不要求物体持续可见。深度配对断流期限为 3 s，等待期间不重发旧目标；恢复后自动继续定位。无效场景观测不覆盖或删除已知障碍。
 
-`PickPlace.Result.error_code` 区分目标不可用、轨迹执行失败和需要恢复。接触前的输入或规划失败只跳过该目标，本批不再重试，其他物体继续处理；执行故障、可能持物或结果不明时停止后续动作。批次末尾汇总未完成目标，存在跳过的失败目标时 `SortObjects.success=false`，完成数只计实际成功的运动流程。脚本报“抓取流程未完成”并保留控制栈，不能把这一任务结果当成节点崩溃。新增了 Action 结果字段，旧节点和终端须统一重新加载构建后的工作区再使用。
+`PickPlace.Result.failure` 与 `MoveToNamed.Result.failure` 使用统一 `Failure` 消息；`SortObjects.Result` 返回 `completed_count` 与 `failures`。确定的目标级输入/规划失败允许跳过，公共场景或服务故障不会伪装成目标失败。有效观测中缺少一种颜色或某个目标时，等待到期后可以处理其余目标；整体断流则单独报错。可能持物或运动结果不明时保留状态，不自动开爪。存在应处理但未完成的目标时 `SortObjects.success=false`，完成数只计运动流程。脚本报告具体失败并保留控制栈。接口变更后需统一重建相关包、重新 source 并重启旧节点。实现范围见[失败处理说明](docs/failure_policy_design.md)。
 
 抬升先沿 Z 轴移动 lift_distance，再通过碰撞检查的搬运规划到达 transport_height；不执行残缺直线路径。脚本在执行期间监测启动进程、Action 期限与取消，请求响应、整批执行和取消确认受 `action_timeouts` 约束。**软件取消、TF 检查或停止发布命令均不保证真机立即停下**。TF 存在不代表精度合格，实际自动抓取前仍需验证目标中心、TCP 和标定。Action 成功只表示运动流程完成，夹持与放置仍需核实。客户端结束后控制栈保持运行，关闭前应确认现场状态。
 

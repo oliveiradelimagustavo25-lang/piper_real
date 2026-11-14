@@ -21,7 +21,7 @@ from std_srvs.srv import SetBool, Trigger
 import yaml
 
 from my_robot_interface.action import MoveToNamed, PickPlace, SortObjects
-from my_robot_interface.msg import DetectedObject, DetectedObjectArray
+from my_robot_interface.msg import DetectedObject, DetectedObjectArray, Failure
 
 
 @pytest.fixture
@@ -137,6 +137,8 @@ def test_mock_layers(tmp_path, monkeypatch, combined):
             start('robot_motion_planning.launch.py', *planning)
             wait(lambda: 'task_planner' in node.get_node_names())
             assert not named.server_is_ready()
+            deadline = time.monotonic() + 8.0
+            wait(lambda: time.monotonic() >= deadline)  # Delayed MoveIt must not kill the executor.
             start('robot_control_moveit.launch.py', 'control_mode:=mock', 'use_rviz:=false')
         wait(lambda: states and named.server_is_ready() and release.service_is_ready())
         wait(lambda: all(client.server_is_ready() for client in controllers))
@@ -418,6 +420,7 @@ def test_planner_recovers_from_observation_gap(tmp_path, ros_probe):
     'color_order', 'nearest', 'all_outside', 'boundary', 'disabled', 'transformed', 'moves_outside',
     'invalid_bounds', 'invalid_length',
     'unavailable', 'execution_fault', 'recovery_required',
+    'missing_color', 'missing_target', 'dependency_fault', 'unknown_facts', 'stream_lost', 'empty_observation',
 ])
 @pytest.mark.parametrize('ros_probe', [179], indirect=True)
 def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
@@ -431,11 +434,15 @@ def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
     params.update(observation_target='', observation_settle_time=0.,
                   grasp_region_enabled=True,
                   grasp_region_min=[.2, -.2, -.15], grasp_region_max=[.5, .2, .1])
-    failures = {'unavailable': PickPlace.Result.TARGET_UNAVAILABLE,
-                'execution_fault': PickPlace.Result.EXECUTION_FAILED,
-                'recovery_required': PickPlace.Result.RECOVERY_REQUIRED}
-    if scenario == 'disabled' or scenario in failures:
+    failures = {'unavailable': Failure.TARGET_UNAVAILABLE,
+                'execution_fault': Failure.EXECUTION_FAILED,
+                'recovery_required': Failure.RECOVERY_REQUIRED,
+                'dependency_fault': Failure.DEPENDENCY_UNAVAILABLE,
+                'unknown_facts': Failure.TARGET_UNAVAILABLE}
+    if scenario == 'disabled' or scenario in failures or scenario in (
+            'missing_color', 'missing_target', 'stream_lost', 'empty_observation'):
         params['grasp_region_enabled'] = False
+    params.update(observation_timeout=.6, max_observation_age=.3)
     if scenario == 'invalid_bounds':
         params['grasp_region_max'] = list(params['grasp_region_min'])
     if scenario == 'invalid_length':
@@ -466,6 +473,10 @@ def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
             obj.pose.position.x, obj.pose.position.y, obj.pose.position.z = point
     if scenario == 'moves_outside':
         observations.objects[0].pose.position.x = .3
+    if scenario == 'missing_color':
+        observations.objects = [o for o in observations.objects if o.color != 2]
+    if scenario == 'empty_observation':
+        observations.objects = []
     transforms = []
     for child, x in [('link6', 0.), ('camera', .5)]:
         tf = TransformStamped()
@@ -484,8 +495,18 @@ def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
         captured.append(handle.request.object_id)
         if scenario in failures and handle.request.object_id == 'cube_1':
             handle.abort()
-            return PickPlace.Result(success=False, error_code=failures[scenario],
+            failure = Failure(code=failures[scenario], origin=Failure.EXECUTOR,
+                              target_specific=scenario in ('unavailable', 'unknown_facts'),
+                              command_state=Failure.TERMINAL, payload_state=Failure.CLEAR,
+                              scene_state=Failure.CONSISTENT, detail='Synthetic target failure')
+            if scenario == 'recovery_required':
+                failure.payload_state = Failure.MAY_HOLD
+            if scenario == 'unknown_facts':
+                failure.command_state = failure.payload_state = failure.scene_state = Failure.UNKNOWN
+            return PickPlace.Result(success=False, failure=failure,
                                     message='Synthetic target failure')
+        if scenario == 'missing_target':
+            observations.objects = [o for o in observations.objects if o.color != 2]
         if scenario == 'moves_outside':
             observations.objects[1].pose.position.x = .8
         handle.succeed()
@@ -498,6 +519,8 @@ def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
     publisher = node.create_publisher(DetectedObjectArray, params['objects_topic'], 10)
 
     def publish():
+        if scenario == 'stream_lost' and captured:
+            return
         observations.header.stamp = node.get_clock().now().to_msg()
         publisher.publish(observations)
 
@@ -512,14 +535,27 @@ def test_planner_filters_grasp_region(tmp_path, ros_probe, scenario):
                 'disabled': ['cube_1', 'cube_2', 'cube_3'],
                 'unavailable': ['cube_1', 'cube_2', 'cube_3'],
                 'execution_fault': ['cube_1'], 'recovery_required': ['cube_1'],
+                'missing_color': ['cube_1', 'cube_3'], 'missing_target': ['cube_1', 'cube_3'],
+                'dependency_fault': ['cube_1'], 'unknown_facts': ['cube_1'],
+                'stream_lost': ['cube_1'],
+                'empty_observation': [],
                 'moves_outside': ['cube_1']}.get(scenario, ['cube_2'])
     assert captured == expected
-    success = bool(expected) and scenario not in failures
+    partial = scenario in ('missing_color', 'missing_target', 'stream_lost', 'empty_observation')
+    success = bool(expected) and scenario not in failures and not partial
     assert outcome.result.success == success
     assert outcome.status == (GoalStatus.STATUS_SUCCEEDED if success else GoalStatus.STATUS_ABORTED)
     if scenario == 'unavailable':
         assert 'completed=2' in outcome.result.message and 'unavailable cube_1' in outcome.result.message
-    if len(expected) < 3 and scenario not in failures:
+    assert outcome.result.completed_count == len(expected) - int(scenario in failures)
+    if scenario == 'all_outside':
+        assert not outcome.result.failures  # Excluded objects are not failed grasps.
+    if partial:
+        assert outcome.result.failures
+        assert outcome.result.failures[0].code == (
+            Failure.OBSERVATION_STALE if scenario in ('stream_lost', 'empty_observation') else
+            Failure.TARGET_UNAVAILABLE)
+    if len(expected) < 3 and scenario not in failures and not partial:
         assert f'completed={len(expected)}, skipped_outside_grasp_region={3-len(expected)}' in outcome.result.message
         for color in range(1, 4):
             if f'cube_{color}' not in expected:
@@ -546,6 +582,22 @@ def test_executor_rejects_bad_configuration(tmp_path, monkeypatch, parameters, r
     assert reason in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize('ros_probe', [186], indirect=True)
+def test_executor_waits_for_missing_model(tmp_path, ros_probe):
+    """A scene service alone must not start unbounded MoveGroup model loading."""
+    from moveit_msgs.srv import GetPlanningScene
+    node = ros_probe.node
+    service = node.create_service(GetPlanningScene, '/get_planning_scene', lambda request, response: response)
+    ros_probe.cleanup(lambda: node.destroy_service(service))
+    path = tmp_path / 'model_wait.yaml'
+    path.write_text(yaml.safe_dump({'pick_place_executor': {'ros__parameters': {'startup_timeout': 1.2}}}))
+    process = ros_probe.start(['ros2', 'run', 'my_robot_commander', 'pick_place_executor',
+                               '--ros-args', '--params-file', str(path)], 'model_wait.log')
+    ros_probe.wait(lambda: process.poll() is not None, timeout=8)
+    assert process.returncode != 0
+    assert 'Timed out waiting for MoveIt scene/model' in (tmp_path / 'model_wait.log').read_text()
+
+
 @pytest.mark.parametrize('initial_feedback', [False, True], ids=['no_feedback', 'measured_feedback'])
 @pytest.mark.parametrize('ros_probe', [182], indirect=True)
 def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, initial_feedback):
@@ -565,7 +617,6 @@ def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, init
     model = ET.fromstring(description)
     hardware = model.find('ros2_control/hardware')
     ET.SubElement(hardware, 'param', name='startup_timeout').text = '3.0'
-    ET.SubElement(hardware, 'param', name='feedback_timeout').text = '0.3'
     config = yaml.safe_load(Path(runpy.run_path(str(moveit / 'launch/demo.launch.py'))[
         '_build_ros2_controllers_file']('piper', 'agx_gripper', 'left', '', True)).read_text())
     config['/arm_controller']['ros__parameters']['constraints']['goal_time'] = .3
@@ -576,10 +627,17 @@ def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, init
     path.write_text(yaml.safe_dump(config))
     node, wait, result = ros_probe.node, ros_probe.wait, ros_probe.result
     publisher = node.create_publisher(JointState, '/feedback/joint_states', 10)
+    stop_requests = []
+    def stop_hardware(request, response):
+        stop_requests.append(time.monotonic())
+        response.success = len(stop_requests) > 1  # First failure must not be silently accepted.
+        return response
+    stop_service = node.create_service(Trigger, '/control_stop', stop_hardware)
+    ros_probe.cleanup(lambda: node.destroy_service(stop_service))
     states, commands = [], []
     names = [f'joint{i}' for i in range(1, 7)] + ['gripper']
     measured = [.20, 0., 0., 0., 0., 0., .025]
-    mode = {'follow': False, 'valid': initial_feedback}
+    mode = {'follow': False, 'valid': initial_feedback, 'paused': False}
 
     def receive_command(msg):
         commands.append(msg)
@@ -590,6 +648,8 @@ def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, init
     node.create_subscription(JointState, '/controller_joint_states', states.append, 10)
 
     def publish():
+        if mode['paused']:
+            return
         msg = JointState(name=names, position=measured, velocity=[0.] * len(names))
         msg.header.stamp = node.get_clock().now().to_msg()
         if not mode['valid']:
@@ -625,6 +685,14 @@ def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, init
         return
     wait(lambda: action.server_is_ready() and states and commands and spawner.poll() == 0)
     assert commands[0].position == pytest.approx(measured)
+    mode['paused'] = True
+    deadline = time.monotonic() + .65
+    wait(lambda: time.monotonic() >= deadline)
+    mode['paused'] = False
+    wait(controllers.service_is_ready)
+    response = result(controllers.call_async(ListControllers.Request()))
+    assert any(c.name == 'arm_controller' and c.state == 'active' for c in response.controller)
+    assert not stop_requests
     handle = goal(.25)
     assert result(handle.get_result_async()).status == GoalStatus.STATUS_ABORTED
     assert states[-1].position[states[-1].name.index('joint1')] == pytest.approx(.20)
@@ -660,13 +728,15 @@ def test_real_hardware_adapter_with_synthetic_feedback(tmp_path, ros_probe, init
             break
     else:
         pytest.fail('Controller remained active after the hardware feedback fault')
+    assert 'last rejected: non-finite joint feedback' in (tmp_path / 'hardware.log').read_text()
+    wait(lambda: len(stop_requests) >= 2)
     count = len(commands)
     deadline = time.monotonic() + .4
     wait(lambda: time.monotonic() >= deadline)
     assert len(commands) <= count + 2
 
 
-@pytest.mark.parametrize('drop_result', [False, True], ids=['cancel', 'lost_result'])
+@pytest.mark.parametrize('drop_result', [False, True, 'late'], ids=['cancel', 'lost_result', 'late_result'])
 @pytest.mark.parametrize('ros_probe', [183], indirect=True)
 def test_planner_execution_watchdog(tmp_path, ros_probe, drop_result):
     """A fake PickPlace never moves; simulate cancellation and a missing final result."""
@@ -726,6 +796,12 @@ def test_planner_execution_watchdog(tmp_path, ros_probe, drop_result):
         assert pending['cancel_seen']
         next_handle = result(sorting.send_goal_async(SortObjects.Goal(color_order=[1])))
         assert next_handle.accepted == (not drop_result)
+        if drop_result == 'late':
+            pending['future'].set_result(None)
+            deadline = time.monotonic() + .3
+            wait(lambda: time.monotonic() >= deadline)
+            next_handle = result(sorting.send_goal_async(SortObjects.Goal(color_order=[1])))
+            assert next_handle.accepted  # Late terminal resolves the child, never restarts the old batch.
         if next_handle.accepted:
             result(next_handle.cancel_goal_async())
             result(next_handle.get_result_async())
@@ -850,9 +926,9 @@ def test_grasp_recovery_and_scene_lifecycle(tmp_path, ros_probe):
         assert handle.accepted
         response = result(handle.get_result_async())
         assert not response.result.success, stage
-        expected_code = (PickPlace.Result.EXECUTION_FAILED if stage == 'Move to pre-grasp' else
-                         PickPlace.Result.RECOVERY_REQUIRED)
-        assert response.result.error_code == expected_code
+        assert response.result.failure.code == Failure.EXECUTION_FAILED
+        assert response.result.failure.payload_state == (
+            Failure.CLEAR if stage == 'Move to pre-grasp' else Failure.MAY_HOLD)
         assert fault['future'] is not None, response.result.message + '\n' + log_path.read_text()[-5000:]
         assert result(fault['future']).ok
         assert ('test_cube' in state()[1]) == attached
@@ -890,6 +966,79 @@ def test_grasp_recovery_and_scene_lifecycle(tmp_path, ros_probe):
     handle = result(picking.send_goal_async(goal))
     response = result(handle.get_result_async())
     assert not response.result.success
-    assert response.result.error_code == PickPlace.Result.TARGET_UNAVAILABLE
+    assert response.result.failure.code == Failure.PLAN_FAILED
+    assert response.result.failure.target_specific
+    assert response.result.failure.command_state == Failure.NOT_SENT
     assert 'Cartesian path incomplete' in response.result.message
     assert not state()[1] and result(clear.call_async(Trigger.Request())).success
+
+    # The preferred transfer height was unreachable for this observed real target.
+    goal.object_pose.pose.position.x, goal.object_pose.pose.position.y = .421, -.179
+    goal.object_pose.pose.position.z = -.120
+    goal.place_pose.pose.position.x, goal.place_pose.pose.position.y = .371, -.189
+    goal.place_pose.pose.position.z = -.1195
+    handle = result(picking.send_goal_async(goal))
+    assert handle.accepted
+    response = result(handle.get_result_async())
+    assert response.result.success, response.result.message
+
+
+@pytest.mark.parametrize('ros_probe', [185], indirect=True)
+def test_motion_reconciles_late_result(tmp_path, ros_probe):
+    """Actual MotionController, mock model, fake ExecuteTrajectory; no controller receives a goal."""
+    from moveit_msgs.action import ExecuteTrajectory
+    from moveit_msgs.msg import MoveItErrorCodes
+    from rclpy.action import CancelResponse
+
+    node, wait, result = ros_probe.node, ros_probe.wait, ros_probe.result
+    calls, pending = [], []
+
+    async def execute(handle):
+        calls.append(handle)
+        if len(calls) == 1:
+            future = rclpy.task.Future()
+            pending.append(future)
+            await future
+            handle.canceled()
+        else:
+            handle.succeed()
+        return ExecuteTrajectory.Result(error_code=MoveItErrorCodes(val=MoveItErrorCodes.SUCCESS))
+
+    server = ActionServer(node, ExecuteTrajectory, '/late_execute', execute_callback=execute,
+                          cancel_callback=lambda _: CancelResponse.ACCEPT)
+    named = ActionClient(node, MoveToNamed, '/manipulation/move_to_named')
+    ros_probe.cleanup(server.destroy)
+    ros_probe.cleanup(named.destroy)
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((root / 'src/my_robot_commander/config/manipulation.yaml').read_text())
+    config['pick_place_executor']['ros__parameters'].update(execution_timeout=.2, cancel_timeout=.2)
+    path = tmp_path / 'motion.yaml'
+    path.write_text(yaml.safe_dump(config))
+    ros_probe.start(['ros2', 'launch', 'my_robot_bringup', 'robot_control_moveit.launch.py',
+                     'control_mode:=mock', 'use_rviz:=false'], 'control.log',
+                    timeout=15, signal_group=False)
+    ros_probe.start(['ros2', 'run', 'my_robot_commander', 'pick_place_executor', '--ros-args',
+                     '--params-file', str(path), *[
+                         value for endpoint in ('send_goal', 'get_result', 'cancel_goal', 'status', 'feedback')
+                         for value in ('-r', f'execute_trajectory/_action/{endpoint}:='
+                                       f'/late_execute/_action/{endpoint}')]],
+                    'motion.log', timeout=8)
+    try:
+        wait(named.server_is_ready, timeout=35)
+        handle = result(named.send_goal_async(MoveToNamed.Goal(target='pose_1')))
+        response = result(handle.get_result_async())
+        assert not response.result.success
+        assert response.result.failure.code == Failure.EXECUTION_RESULT_UNKNOWN
+        assert len(calls) == 1
+        assert not result(named.send_goal_async(MoveToNamed.Goal(target='pose_1'))).accepted
+        pending[0].set_result(None)
+        deadline = time.monotonic() + .3
+        wait(lambda: time.monotonic() >= deadline)
+        assert len(calls) == 1  # No automatic replay after the delayed terminal result.
+        handle = result(named.send_goal_async(MoveToNamed.Goal(target='pose_1')))
+        assert handle.accepted
+        assert result(handle.get_result_async()).result.success
+        assert len(calls) == 2
+    finally:
+        if pending and not pending[0].done():
+            pending[0].set_result(None)

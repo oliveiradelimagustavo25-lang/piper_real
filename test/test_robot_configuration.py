@@ -1,5 +1,6 @@
 """Validate model contracts and launch composition without starting hardware."""
 import importlib.util
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
@@ -18,6 +19,89 @@ ROOT = Path(__file__).resolve().parents[1]
 MOVEIT = Path(get_package_share_directory('agx_arm_moveit'))
 CTRL = Path(get_package_share_directory('agx_arm_ctrl'))
 BRINGUP = ROOT / 'src/my_robot_bringup/launch'
+
+
+def test_failure_policy():
+    executable = ROOT / 'build/my_robot_interface/failure_policy_probe'
+    assert executable.is_file(), 'Build my_robot_interface with BUILD_TESTING=ON first'
+    response = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
+    assert response.returncode == 0, response.stdout + response.stderr
+
+
+@pytest.mark.parametrize('age,valid', [(0.2, True), (0.7, True), (2.0, False)])
+def test_driver_feedback_uses_measurement_time(age, valid):
+    driver = module(ROOT / 'src/agx_ros_control_moveit/agx_arm_ctrl/agx_arm_ctrl/agx_arm_ctrl_single_node.py')
+    cls = driver.AgxArmRosNode
+    state = SimpleNamespace(timestamp=1000.0-age, hz=0, msg=[0.] * 6)
+    sdk = SimpleNamespace(is_connected=lambda: True, get_joint_angles=lambda: state,
+                          get_motor_states=lambda _: SimpleNamespace(msg=SimpleNamespace(velocity=0., torque=0.)))
+    sent = []
+    node = SimpleNamespace(agx_arm=sdk, arm_joint_count=6, arm_joint_names=[f'joint{i}' for i in range(1, 7)],
+                           get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1000_000_000_000)),
+                           joint_states_pub=SimpleNamespace(publish=sent.append),
+                           _get_gripper_joint_data=lambda: [], _get_hand_joint_data=lambda: [])
+    node._feedback_recent = lambda value: cls._feedback_recent(node, value)
+    node._joint_feedback_valid = lambda value: cls._joint_feedback_valid(node, value)
+    node._float_to_ros_time = lambda stamp: cls._float_to_ros_time(node, stamp)
+    assert cls._check_arm_ready(node) == valid
+    cls._publish_joint_states(node)
+    assert bool(sent) == valid
+    if sent:
+        assert sent[0].header.stamp.sec + sent[0].header.stamp.nanosec / 1e9 == pytest.approx(state.timestamp)
+
+
+@pytest.mark.parametrize('send_failed', [False, True, 'silent'])
+def test_driver_stop_needs_no_feedback_or_mode_change(send_failed):
+    driver = module(ROOT / 'src/agx_ros_control_moveit/agx_arm_ctrl/agx_arm_ctrl/agx_arm_ctrl_single_node.py')
+    calls = []
+    def stop():
+        calls.append('stop')
+        if send_failed is True:
+            raise RuntimeError('CAN unavailable')
+    node = SimpleNamespace(agx_arm=SimpleNamespace(electronic_emergency_stop=stop,
+                           has_comm_error=lambda: send_failed == 'silent',
+                           get_comm_error=lambda: 'TX buffer unavailable'),
+                           control_enabled=True, _last_joint_command=10.,
+                           get_logger=lambda: SimpleNamespace(error=lambda *args, **kwargs: None, info=lambda _: None))
+    node._stop_control = lambda: driver.AgxArmRosNode._stop_control(node)
+    response = driver.AgxArmRosNode._control_stop_callback(node, None, SimpleNamespace(success=False, message=''))
+    assert calls == ['stop'] and response.success == (not send_failed)
+    assert not node.control_enabled and node._stop_pending == bool(send_failed)
+    assert (node._last_joint_command is None) == (not send_failed)
+    node._control_stop_callback = lambda request, response: driver.AgxArmRosNode._control_stop_callback(node, request, response)
+    node.control_enabled = True
+    node._last_joint_command = driver.time.monotonic() - .65
+    driver.AgxArmRosNode._check_command_timeout(node)
+    assert calls == ['stop']
+    node._last_joint_command = driver.time.monotonic() - 1.1
+    driver.AgxArmRosNode._check_command_timeout(node)
+    driver.AgxArmRosNode._check_command_timeout(node)
+    assert calls == ['stop', 'stop']  # One request, not a repeated stop on every timer tick.
+    legacy = SimpleNamespace()
+    assert driver.AgxArmRosNode._emergency_stop_callback(node, None, legacy) is legacy
+    assert calls == ['stop', 'stop', 'stop']
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_driver_enable_reports_joint_feedback(enabled):
+    driver = module(ROOT / 'src/agx_ros_control_moveit/agx_arm_ctrl/agx_arm_ctrl/agx_arm_ctrl_single_node.py')
+    sdk = SimpleNamespace(get_driver_states=lambda _: object(), enable=lambda: True,
+                          get_joint_enable_status=lambda _: enabled)
+    logger = SimpleNamespace(info=lambda *_: None, warn=lambda *_: None)
+    node = SimpleNamespace(agx_arm=sdk, enable_flag=False, _feedback_recent=lambda _: True,
+                           get_logger=lambda: logger)
+    assert driver.AgxArmRosNode._enable_arm(node) is enabled
+    assert node.enable_flag is enabled
+
+
+def test_script_rejects_an_existing_stack(monkeypatch):
+    ticks = iter([0., 0., 2.])
+    monkeypatch.setattr(grasp, 'time', SimpleNamespace(monotonic=lambda: next(ticks, 2.)))
+    import rclpy
+    monkeypatch.setattr(rclpy, 'spin_once', lambda *args, **kwargs: None)
+    node = SimpleNamespace(get_node_names_and_namespaces=lambda: [('move_group', '/')])
+    with pytest.raises(RuntimeError, match='move_group'):
+        grasp.ensure_no_stack(node)
 
 
 def module(path):

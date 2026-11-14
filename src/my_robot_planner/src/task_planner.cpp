@@ -15,12 +15,15 @@
 #include <my_robot_interface/action/move_to_named.hpp>
 #include <my_robot_interface/action/sort_objects.hpp>
 #include <my_robot_interface/msg/detected_object_array.hpp>
+#include <my_robot_interface/failure_policy.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+
+namespace policy = my_robot_interface::failure;
 
 using namespace std::chrono_literals;
 
@@ -31,6 +34,8 @@ class TaskPlanner : public rclcpp::Node
   using Named = my_robot_interface::action::MoveToNamed;
   using Object = my_robot_interface::msg::DetectedObject;
   using Objects = my_robot_interface::msg::DetectedObjectArray;
+  using Failure = policy::Failure;
+  using Decision = policy::Decision;
   using SortHandle = rclcpp_action::ServerGoalHandle<Sort>;
   enum class Phase {WAITING, SENDING, EXECUTING};
 
@@ -121,7 +126,7 @@ public:
         order_ = goal->color_order.empty() ? default_order_ : goal->color_order;
         pending_.clear();
         skipped_.clear();
-        unavailable_.clear();
+        failures_.clear();
         batch_ready_ = false;
         completed_ = 0;
         // A new batch starts at the current pose. A named observation pose is
@@ -256,18 +261,23 @@ private:
     task_->publish_feedback(update);
   }
 
-  void finish(bool success, const std::string & message, bool canceled = false)
+  void finish(bool success, const std::string & message, bool canceled = false,
+    std::optional<Failure> failure = std::nullopt)
   {
     auto result = std::make_shared<Sort::Result>();
-    result->success = success && unavailable_.empty();
+    if (failure) {failures_.push_back(*failure);}
+    result->success = success && completed_ > 0 && failures_.empty();
+    result->completed_count = completed_;
+    result->failures = failures_;
     result->message = message;
     if (!skipped_.empty()) {
       result->message += "; completed=" + std::to_string(completed_) + ", skipped_outside_grasp_region=" +
         std::to_string(skipped_.size()) + " IDs:";
       for (const auto & id : skipped_) {result->message += " " + id;}
     }
-    for (const auto & item : unavailable_) {
-      result->message += "; unavailable " + item.first + ": " + item.second;
+    for (const auto & failure : failures_) {
+      result->message += "; " + std::string(failure.target_specific ? "unavailable " : "failure ") +
+        failure.object_id + ": " + failure.detail;
     }
     if (canceled) {
       task_->canceled(result);
@@ -282,16 +292,36 @@ private:
     busy_ = false;
   }
 
-  void waiting(const std::string & reason)
+  Failure problem(uint16_t code, const std::string & detail, const std::string & id = "")
+  {
+    auto failure = policy::makeFailure(code, Failure::PLANNER, detail);
+    failure.stage = Failure::OBSERVE;
+    failure.object_id = id;
+    failure.target_specific = !id.empty();
+    failure.command_state = Failure::NOT_SENT;
+    failure.payload_state = Failure::CLEAR;
+    failure.scene_state = Failure::CONSISTENT;
+    return failure;
+  }
+
+  bool observationExpired() const
+  {
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - waiting_since_).count() >= timeout_;
+  }
+
+  void waiting(const std::string & reason, uint16_t code = Failure::OBSERVATION_STALE)
   {
     if (reason != waiting_reason_) {
       waiting_reason_ = reason;
       RCLCPP_INFO(get_logger(), "%s", reason.c_str());
     }
-    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - waiting_since_).count()
-      >= timeout_)
-    {
-      finish(false, "Timed out: " + reason);
+    const auto elapsed = std::chrono::steady_clock::now() - waiting_since_;
+    const auto remaining_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::duration<double>(timeout_) - elapsed);
+    const auto failure = problem(code, reason);
+    if (policy::decideStep(failure, remaining_wait) != Decision::Wait) {
+      finish(false, "Timed out: " + reason, false, failure);
     }
   }
 
@@ -318,11 +348,14 @@ private:
     typename rclcpp_action::Client<Action>::SendGoalOptions options;
     options.goal_response_callback = [this, task, client, label](typename Handle::SharedPtr handle) {
         if (task_ != task) {
-          if (handle) {client->async_cancel_goal(handle);}
+          if (handle) {client->async_cancel_goal(handle);} else {execution_unknown_ = false;}
           return;
         }
         if (!handle) {
-          finish(false, label + " rejected", task->is_canceling());
+          auto failure = policy::makeFailure(
+            Failure::DEPENDENCY_UNAVAILABLE, Failure::PLANNER, label + " rejected");
+          failure.command_state = Failure::NOT_SENT;
+          finish(false, label + " rejected", task->is_canceling(), failure);
         } else {
           cancel_active_ = [client, handle]() {client->async_cancel_goal(handle);};
           phase_ = Phase::EXECUTING;
@@ -330,13 +363,27 @@ private:
         }
       };
     options.result_callback = [this, task, label, on_result](const typename Handle::WrappedResult & r) {
-        if (task_ != task) { return; }
+        if (task_ != task) {
+          if (r.result && r.code != rclcpp_action::ResultCode::UNKNOWN) {
+            execution_unknown_ = false;  // Only this child's terminal state is reconciled.
+            RCLCPP_INFO(get_logger(), "%s late terminal result reconciled; batch stays finished",
+              label.c_str());
+          }
+          return;
+        }
         cancel_active_ = {};
         if (!r.result || r.code == rclcpp_action::ResultCode::UNKNOWN) {
           execution_unknown_ = true;
-          finish(false, label + " returned no result; recovery required", task->is_canceling());
+          auto failure = problem(Failure::EXECUTION_RESULT_UNKNOWN, label + " returned no result");
+          failure.command_state = failure.payload_state = failure.scene_state = Failure::UNKNOWN;
+          finish(false, label + " returned no result; recovery required", task->is_canceling(), failure);
         } else if (!stop_reason_.empty()) {
-          finish(false, stop_reason_ + "; " + r.result->message, task->is_canceling());
+          auto failure = r.result->failure;
+          if (failure.code == Failure::NONE) {
+            failure.code = Failure::EXECUTION_TIMEOUT;
+            failure.detail = stop_reason_;
+          }
+          finish(false, stop_reason_ + "; " + r.result->message, task->is_canceling(), failure);
         } else {
           on_result(r);
         }
@@ -353,7 +400,8 @@ private:
         if (task_->is_canceling()) {
           finish(false, "Sorting canceled after observation motion", true);
         } else if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !result.result->success) {
-          finish(false, "Observation motion failed: " + result.result->message);
+          finish(false, "Observation motion failed: " + result.result->message,
+            false, result.result->failure);
         } else {
           awaitObservations();
         }
@@ -390,11 +438,15 @@ private:
     feedback(object.object_id);
     sendGoal(pick_client_, goal, "PickPlace", [this, id = object.object_id](const auto & r) {
         const bool success = r.code == rclcpp_action::ResultCode::SUCCEEDED && r.result->success;
+        auto failure = r.result->failure;
+        failure.object_id = id;
+        if (!success && failure.code == Failure::NONE) {failure.code = Failure::UNCLASSIFIED;}
+        const auto decision = policy::decideBatch(failure);
         const bool unavailable = r.code == rclcpp_action::ResultCode::ABORTED &&
-          r.result->error_code == Pick::Result::TARGET_UNAVAILABLE;
+          decision == Decision::SkipTarget;
         if (success || unavailable) {pending_.erase(id);}
         if (unavailable) {
-          unavailable_[id] = r.result->message;
+          failures_.push_back(failure);
           RCLCPP_WARN(get_logger(), "Skipping unavailable target %s: %s",
             id.c_str(), r.result->message.c_str());
         }
@@ -405,7 +457,7 @@ private:
         if (task_->is_canceling()) {
           finish(false, "Sorting canceled after active PickPlace returned", true);
         } else if (!success && !unavailable) {
-          finish(false, "PickPlace failed for " + id + ": " + r.result->message);
+          finish(false, "PickPlace failed for " + id + ": " + r.result->message, false, failure);
         } else if (pending_.empty()) {
           finish(true, "Batch processing finished; completed=" + std::to_string(completed_) +
             "; placement needs visual verification");
@@ -441,8 +493,10 @@ private:
       }
       if (std::chrono::duration<double>(clock_now - *stop_since_).count() >= cancel_timeout_) {
         execution_unknown_ = true;
+        auto failure = problem(Failure::EXECUTION_RESULT_UNKNOWN, stop_reason_);
+        failure.command_state = failure.payload_state = failure.scene_state = Failure::UNKNOWN;
         finish(false, stop_reason_ + "; final result missing, new tasks blocked until recovery",
-          task_->is_canceling());
+          task_->is_canceling(), failure);
       }
       return;
     }
@@ -450,7 +504,7 @@ private:
     try {
       if (needs_observation_) {
         if (!named_client_->action_server_is_ready()) {
-          waiting("Waiting for observation motion server");
+          waiting("Waiting for observation motion server", Failure::DEPENDENCY_UNAVAILABLE);
         } else {
           observe();
         }
@@ -479,12 +533,19 @@ private:
       for (const auto & object : objects) {observed_colors.insert(object.color);}
       filterRegion(objects);
       if (!batch_ready_) {
+        if (observed_colors.empty()) {
+          waiting("Waiting for valid target observations");
+          return;
+        }
         for (const auto color : order_) {
-          // A visible but excluded color must not block eligible colors. A color
-          // never observed still uses the existing bounded observation wait.
           if (observed_colors.count(color) == 0) {
-            waiting("Waiting for requested color " + std::to_string(color));
-            return;
+            if (!observationExpired()) {
+              waiting("Waiting for requested color " + std::to_string(color));
+              return;
+            }
+            failures_.push_back(problem(Failure::TARGET_UNAVAILABLE,
+              "Requested color not observed within the observation budget",
+              "color:" + std::to_string(color)));
           }
         }
         // 固定本批 ID，防止已放置物体被重新识别后再次进入任务。
@@ -509,27 +570,47 @@ private:
           candidates.push_back(object);
         }
       }
-      // 颜色顺序中，前一种颜色暂时丢失时等待它，不提前抓下一种。
+      uint8_t waiting_color = 0;
+      // 颜色顺序先等待当前颜色，预算耗尽后才记录缺失并处理下一种。
       if (strategy_ == "color_order") {
         const auto first = std::find_if(order_.begin(), order_.end(), [this](uint8_t color) {
           return std::any_of(pending_.begin(), pending_.end(),
             [color](const auto & item) { return item.second == color; });
         });
+        waiting_color = *first;
         candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
           [first](const auto & object) { return object.color != *first; }), candidates.end());
       }
       if (candidates.empty()) {
-        waiting("Waiting for a remaining object in this batch");
+        if (observationExpired() && !objects.empty()) {
+          // Fresh valid detections distinguish one missing target from a broken input chain.
+          for (auto it = pending_.begin(); it != pending_.end();) {
+            if (strategy_ != "color_order" || it->second == waiting_color)
+            {
+              failures_.push_back(problem(Failure::TARGET_UNAVAILABLE,
+                "Target not observed within the observation budget", it->first));
+              it = pending_.erase(it);
+            } else {++it;}
+          }
+          if (pending_.empty()) {finish(true, "Batch processing finished");}
+          else {awaitObservations();}
+        } else {
+          waiting("Waiting for a remaining object in this batch");
+        }
       } else if (!pick_client_->action_server_is_ready()) {
-        waiting("Waiting for PickPlace action server");
+        waiting("Waiting for PickPlace action server", Failure::DEPENDENCY_UNAVAILABLE);
       } else {
         dispatch(selectTarget(candidates));
       }
     } catch (const tf2::TransformException & error) {
-      waiting("Waiting for TF: " + std::string(error.what()));
+      waiting("Waiting for TF: " + std::string(error.what()), Failure::TF_UNAVAILABLE);
     } catch (const std::exception & error) {
       if (phase_ != Phase::WAITING) {execution_unknown_ = true;}
-      finish(false, error.what());
+      auto failure = problem(Failure::UNCLASSIFIED, error.what());
+      if (execution_unknown_) {
+        failure.command_state = failure.payload_state = failure.scene_state = Failure::UNKNOWN;
+      }
+      finish(false, error.what(), false, failure);
     }
   }
 
@@ -553,7 +634,7 @@ private:
   std::array<bool, 3> place_relative_axes_{};
   std::vector<uint8_t> default_order_, order_;
   std::map<std::string, uint8_t> pending_;
-  std::map<std::string, std::string> unavailable_;
+  std::vector<Failure> failures_;
   std::set<std::string> skipped_;
   double max_age_, timeout_, settle_time_;
   double response_timeout_, execution_timeout_, cancel_timeout_;

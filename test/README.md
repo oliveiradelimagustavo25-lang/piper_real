@@ -11,7 +11,8 @@ test/
 ├── test_handeye.py              # 手眼求解、存储与合成 TF 标定
 ├── test_conversions.py          # SDK 转换检查的 Python 入口
 └── native/
-    └── test_conversions.cpp     # 直接测试项目实际使用的 C++ 转换实现
+    ├── test_conversions.cpp     # 直接测试项目实际使用的 C++ 转换实现
+    └── test_failure_policy.cpp  # 直接测试公共失败处理规则，无需启动节点
 ```
 
 三物料启动检查已并入配置测试；视觉模式选择也只在配置测试中检查一次。已移除不属于本项目功能回归的三份上游模板 lint 脚本。上游 AGX 和 easy_handeye2 源码未因这次整理修改。
@@ -39,9 +40,9 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
   /usr/bin/python3 -m pytest -v test/
 ```
 
-当前共 **109 项 pytest 用例**：配置 61、规划及模拟联动 30、视觉 12、手眼 5、转换 1。转换入口内部还有 9 项 C++ GTest 检查，不重复计入 pytest 数量。正常结果为 `109 passed`；失败表示相应用例未满足要求。通过不代表实物位置精度、夹持质量或手眼结果已经验收。
+当前共 **126 项 pytest 用例**：配置 69、规划及模拟联动 39、视觉 12、手眼 5、转换 1。转换入口内部还有 9 项 C++ GTest 检查，不重复计入 pytest 数量。完整运行预期为 `126 passed`；收集数量不代表已执行通过。通过不代表实物位置精度、夹持质量或手眼结果已经验收。
 
-这些测试不启用 CAN、真机驱动或实物相机。模拟联动使用域 175，控制门 177，手眼 178，放置坐标 179，夹持恢复 181，硬件适配器合成反馈 182，Planner 超时 183，非法执行器配置 184；视觉和转换直接运行使用命令指定的 176。不要在这些域运行实际应用，也不要同时运行两份测试或使用 pytest-xdist。它们会发布合成相机、物体、TF 和关节消息。
+这些测试不启用 CAN、真机驱动或实物相机。模拟联动使用域 175，控制门 177，手眼 178，放置坐标 179，夹持恢复 181，硬件适配器合成反馈 182，Planner 超时 183，非法执行器配置 184，运动终态对账 185；视觉和转换直接运行使用命令指定的 176。不要在这些域运行实际应用，也不要同时运行两份测试或使用 pytest-xdist。它们会发布合成相机、物体、TF 和关节消息。
 
 可按文件运行，也可用 `文件::用例名` 定位：
 
@@ -53,10 +54,14 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 
 ## 配置与前置条件：`test_robot_configuration.py`
 
-61 项，不启动 ROS 节点或真实硬件。依赖已安装的机器人模型、启动模块、xacro 和项目配置；TF 检查使用模拟数据。
+69 项，不启动 ROS 节点或真实硬件。依赖已安装的机器人模型、启动模块、xacro 和项目配置；TF 检查使用模拟数据。
 
 | 用例 | 验证内容及通过标准 |
 | --- | --- |
+| `test_failure_policy`，1 项 | 运行 `build/my_robot_interface/failure_policy_probe`，直接检查生产 C++ 规则；未知状态不误放行，目标失败可隔离，公共依赖不能跳过，等待有期限，可能持物/场景不明不继续。先构建接口包并启用 BUILD_TESTING；本项不启动 ROS 节点 |
+| `test_driver_feedback_uses_measurement_time`，3 项 | 用模拟 SDK 直接调用驱动方法，验证 hz=0 但测量仍新鲜时可发布，时间戳保持原值，过期测量不发布；不创建 SDK 设备实例 |
+| `test_driver_stop_needs_no_feedback_or_mode_change`，3 项 | 模拟停止发送成功、抛异常及 SDK 静默记录错误，验证不读取反馈或切换运动模式；失败不报告发送成功；短间隔不触发命令 watchdog，超时请求停止，原 Empty 急停入口共用同一路径 |
+| `test_script_rejects_an_existing_stack`，1 项 | 模拟 ROS 图中已有项目节点，启动脚本在创建子进程前拒绝重复启动 |
 | `test_named_states_fit_actual_model`，4 项 | Piper、Piper X、Nero 的模型资源匹配型号；命名状态在关节限位内；Piper 保留 pose_1/pose_2；夹爪仅保留官方命名状态，总开口与 mimic 关系一致 |
 | `test_follow_selects_official_state`，2 项 | real 模型实际选择 AgxTopicSystem，mock 选择 GenericSystem；反馈话题与模式匹配，无遗留话题改名或 Octomap 参数 |
 | `test_official_driver_endpoints_are_not_renamed`，1 项 | 官方控制和反馈话题保持原名 |
@@ -83,7 +88,7 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 
 ## 三层模拟联动：`test_robot_launch.py`
 
-30 项。三层联动只使用 mock 硬件；放置坐标用例只运行实际 C++ Planner，测试执行器拒绝全部运动请求。硬件适配器用真实插件接收合成反馈，不启动官方设备驱动。依赖 MoveIt、ros2_control、controller_manager_msgs、trajectory_msgs、moveit_msgs、插件和已构建的 hardware/commander/planner/perception。
+39 项。三层联动只使用 mock 硬件；放置坐标用例只运行实际 C++ Planner，测试执行器拒绝全部运动请求。硬件适配器用真实插件接收合成反馈，不启动官方设备驱动。依赖 MoveIt、ros2_control、controller_manager_msgs、trajectory_msgs、moveit_msgs、插件和已构建的 hardware/commander/planner/perception。
 
 | 用例 | 使用结果判定 |
 | --- | --- |
@@ -92,11 +97,15 @@ ROS_DOMAIN_ID=176 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/piper_test_logs \
 | `test_control_gate_retries_and_synchronizes` | 模拟门控服务晚启动、拒绝、重启、延迟响应时，客户端会重试并恢复正确开关状态；手臂或夹爪仍在执行时不提前关门 |
 | `test_planner_resolves_place_positions`，5 项 | 检查全 absolute、混合、全 relative，以及错误长度/未知模式；截获实际 Planner 的 place_pose，验证物体旋转不改变偏移轴、多次任务不会累加偏移。没有命名运动服务且配置了物料间观察位，首次分拣仍能直接派发。测试执行器始终拒绝请求，不执行抓取 |
 | `test_planner_recovers_from_observation_gap`，1 项 | 空观测持续超过 5 s 后批次仍等待；旧时间戳不触发抓取；新观测到来后可派发，夹杂非法记录不丢弃有效目标。模拟执行器拒绝运动 |
-| `test_planner_filters_grasp_region`，12 项 | 真实 Planner 配合合成物体和模拟执行器，验证两种策略的区域筛选、全部越界、边界包含、关闭筛选、坐标转换、批次中移出区域和非法配置。新增三项：目标不可用后继续处理另两件，控制故障或待恢复则不派发后续件；部分完成返回失败并列出原因。无 MoveIt 或硬件 |
+| `test_planner_filters_grasp_region`，18 项 | 真实 Planner 配合合成物体和模拟执行器，验证区域筛选及两种策略、边界、坐标变换、移出区域和非法配置；目标不可用、缺色、单目标失联时处理其余物体并报告部分未完成；执行故障、公共依赖失败、必要状态未知时不继续派发；断流和空观测分别给出观测错误。无 MoveIt 或硬件 |
 | `test_grasp_recovery_and_scene_lifecycle`，1 项 | 真实 MoveIt/Executor 配合 mock 硬件，覆盖执行失败、持物恢复、场景清理、无相机 TF 的目标和 Z=-138 mm 下降碰撞。新压缩配置下，30 mm 物块的模拟闭爪反馈应达到约 32 mm，完整抓放后可用命名接口回 home；本项不操作真机 |
 | `test_executor_rejects_bad_configuration`，4 项 | NaN TCP、NaN 距离、负观测年龄和缺少 MoveIt 依赖时均明确失败；不启动设备驱动，不发送运动 |
+| `test_executor_waits_for_missing_model`，1 项 | 域 186 只提供假场景服务、不提供机器人模型；Executor 必须在给定启动期限内明确退出，不能进入无限模型/服务等待 |
 | `test_real_hardware_adapter_with_synthetic_feedback`，2 项 | 无有效反馈拒绝激活且无命令；非零初始反馈正确同步；机械臂命令到位而反馈不动时失败，合成反馈跟随才成功；夹爪合成开口差 15 mm 时默认不因位置误差中止，显式指定 3 mm 检查则失败，反馈始终保持实际合成值；NaN 停流后停止发布并停用相关控制器。无反馈时 Humble 的 controller_manager 可能报告激活失败并退出，这是测试预期，不能当作真机验收 |
-| `test_planner_execution_watchdog`，2 项 | 模拟 PickPlace 不结束，Planner 超时请求取消；得到最终结果后可接收新请求，无最终结果则拒绝后续批次 |
+
+硬件适配器用例还验证默认 1.0 秒反馈期限：0.65 秒短暂停顿不会请求停止，持续无效反馈会请求假停止服务、重试第一次失败并复查控制器已停用。分层启动用例将 MoveIt 延迟 8 秒启动；本轮没有做真机冷启动或物理停稳验收。
+| `test_planner_execution_watchdog`，3 项 | 模拟 PickPlace 不结束，Planner 超时请求取消；无最终结果时拒绝后续批次；正常或晚到的终态只解除对应未决记录，不自动续跑旧批次 |
+| `test_motion_reconciles_late_result`，1 项 | 实际 MotionController 配合 mock 模型和假 ExecuteTrajectory，超时后拒绝新命名运动，晚到终态后能接受显式新请求；核对没有自动重发。五个 Action 端点显式重映射，控制器不接收测试轨迹；无 CAN 或真机驱动 |
 
 测试只清理自己启动的进程。已知 MoveIt 在退出阶段可能出现 SIGSEGV；现有用例会将这一已知问题明确报告为警告，其他异常退出仍判失败。模拟轨迹成功不等于真机到位；门控服务测试也不等于硬件急停测试。
 
@@ -156,7 +165,7 @@ colcon test --packages-select my_robot_bringup my_robot_perception vidu_ros2_wra
 colcon test-result --verbose
 ```
 
-包级结果还包含 ament 的代码规范检查，数量与 96 项 pytest 不同；`test/` 中不再混入上游模板 lint。包级日志位于 `build/<包名>/Testing/Temporary/` 及 `log/latest_test/`。直接 pytest 的临时目录由 pytest 管理，失败输出会给出路径；`ROS_LOG_DIR` 保存 ROS 自身日志。
+包级结果还包含 ament 的代码规范检查，数量与根目录 pytest 不同；`test/` 中不再混入上游模板 lint。包级日志位于 `build/<包名>/Testing/Temporary/` 及 `log/latest_test/`。直接 pytest 的临时目录由 pytest 管理，失败输出会给出路径；`ROS_LOG_DIR` 保存 ROS 自身日志。
 
 常见失败处理：
 

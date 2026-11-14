@@ -159,6 +159,19 @@ def check_tf(node, buffer, config):
         raise RuntimeError('机器人到相机的 TF 已过期或时间异常')
 
 
+def ensure_no_stack(node):
+    import rclpy
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=.1)
+    owned = {'controller_manager', 'move_group', 'pick_place_executor', 'task_planner',
+             'vidu_ros2_wrapper_node'}
+    found = sorted(name for name, namespace in node.get_node_names_and_namespaces()
+                   if namespace == '/' and name in owned)
+    if found:
+        raise RuntimeError('当前 ROS 域已有项目节点，请先复用或关闭原栈：' + ', '.join(found))
+
+
 def execute_goal(node, client, goal, check, label, feedback_callback=None,
                  response_timeout=5.0, execution_timeout=600.0, cancel_timeout=10.0):
     """Wait for one guarded action to finish before allowing the next one."""
@@ -219,7 +232,13 @@ def execute_goal(node, client, goal, check, label, feedback_callback=None,
     if response is None or response.result is None:
         raise RuntimeError(f'{label}: Action 返回空结果，执行状态未知')
     if response.status != GoalStatus.STATUS_SUCCEEDED or not response.result.success:
-        raise RuntimeError(f'{label}未完成: {response.result.message}')
+        failures = getattr(response.result, 'failures', [])
+        if not failures and hasattr(response.result, 'failure'):
+            failures = [response.result.failure]
+        details = '; '.join(f'code={f.code}, stage={f.stage}, object={f.object_id}: {f.detail}'
+                            for f in failures if f.code != f.NONE)
+        raise RuntimeError(f'{label}未完成: {response.result.message}' +
+                           (f' [{details}]' if details else ''))
     return response.result
 
 
@@ -250,6 +269,9 @@ def run(config):
     from rclpy.action import ActionClient
     from tf2_ros import Buffer, TransformListener, TransformException
     from my_robot_interface.action import MoveToNamed, SortObjects
+    from controller_manager_msgs.srv import ListControllers
+    from sensor_msgs.msg import JointState
+    from rclpy.qos import qos_profile_sensor_data
 
     try:
         hardware = Path(get_package_prefix('my_robot_hardware'))
@@ -273,16 +295,30 @@ def run(config):
     command = make_command(config, planner_file, manipulation_file)
     print('启动:', shlex.join(command), flush=True)
     # Retain the stack after this client exits: stopping controllers while holding is unsafe.
-    launch = subprocess.Popen(command, cwd=WORKSPACE, start_new_session=True)
-    print(f'启动进程 PID: {launch.pid}；任务结束后控制栈继续运行，需自行安全关闭。', flush=True)
     rclpy.init()
     node = rclpy.create_node('three_material_grasp_client')
+    try:
+        ensure_no_stack(node)
+        launch = subprocess.Popen(command, cwd=WORKSPACE, start_new_session=True)
+    except Exception:
+        node.destroy_node()
+        rclpy.shutdown()
+        raise
+    print(f'启动进程 PID: {launch.pid}；任务结束后控制栈继续运行，需自行安全关闭。', flush=True)
     buffer = Buffer()
     listener = TransformListener(buffer, node)
     planner = config['planner']['task_planner']['ros__parameters']
     named = ActionClient(node, MoveToNamed,
                          planner.get('move_to_named_action', '/manipulation/move_to_named'))
     client = ActionClient(node, SortObjects, planner.get('action_name', '/sorting/sort_objects'))
+
+    feedback = []
+    def receive_feedback(message):
+        feedback[:] = [message, time.monotonic()]
+    node.create_subscription(JointState, '/feedback/joint_states', receive_feedback,
+                             qos_profile_sensor_data)
+    controllers = node.create_client(ListControllers, '/controller_manager/list_controllers')
+    status = None
 
     def check():
         if launch.poll() is not None:
@@ -297,9 +333,22 @@ def run(config):
             try:
                 check()
                 check_tf(node, buffer, config)
-                if client.server_is_ready() and (not needs_named or named.server_is_ready()):
+                if controllers.service_is_ready() and (status is None or status.done()):
+                    if status is not None:
+                        active = {c.name for c in status.result().controller if c.state == 'active'}
+                    else:
+                        active = set()
+                    status = controllers.call_async(ListControllers.Request())
+                else:
+                    active = set()
+                fresh = config['launch'].get('control_mode', 'real') == 'mock' or (
+                    bool(feedback) and time.monotonic() - feedback[1] <= 1.0 and (
+                    -.1 <= node.get_clock().now().nanoseconds / 1e9 -
+                    (feedback[0].header.stamp.sec + feedback[0].header.stamp.nanosec / 1e9) <= 1.0))
+                if (fresh and {'arm_controller', 'gripper_controller'} <= active and
+                        client.server_is_ready() and (not needs_named or named.server_is_ready())):
                     break
-                last_error = '等待命名运动与分拣 Action 服务' if needs_named else '等待分拣 Action 服务'
+                last_error = '等待控制器 active、真实反馈及任务 Action 就绪'
             except (TransformException, RuntimeError) as error:
                 last_error = str(error)
         else:

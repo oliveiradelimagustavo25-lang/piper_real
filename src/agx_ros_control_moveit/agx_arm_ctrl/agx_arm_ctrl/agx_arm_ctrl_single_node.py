@@ -18,7 +18,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from builtin_interfaces.msg import Time
-from std_srvs.srv import SetBool, Empty
+from std_srvs.srv import SetBool, Empty, Trigger
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from scipy.spatial.transform import Rotation as R
 
@@ -140,6 +140,8 @@ class AgxArmRosNode(Node):
         self.tcp_offset = self.get_parameter("tcp_offset").value
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
         self.control_enabled = self.get_parameter("control_enabled").value
+        self._last_joint_command = None
+        self._stop_pending = False
 
         if self.arm_type not in ArmModel.__dict__.values():
             self.get_logger().error(
@@ -399,6 +401,8 @@ class AgxArmRosNode(Node):
         self.create_service(SetBool, "control_enable", self._control_gate_callback)
         self.create_service(Empty, "move_home", self._move_home_callback)
         self.create_service(Empty, "emergency_stop", self._emergency_stop_callback)
+        self.create_service(Trigger, "control_stop", self._control_stop_callback)
+        self.create_timer(0.1, self._check_command_timeout)
         if not self.is_switch_seamlessly:
             self.create_service(Empty, "exit_teach_mode", self._exit_teach_mode_callback)
 
@@ -418,9 +422,45 @@ class AgxArmRosNode(Node):
 
     def _check_arm_ready(self) -> bool:
         joint_states = self.agx_arm.get_joint_angles()
-        if joint_states is None or joint_states.hz <= 0:
-            return False
-        return True
+        return self._joint_feedback_valid(joint_states)
+
+    def _feedback_recent(self, state) -> bool:
+        return (state is not None and self.agx_arm.is_connected() and
+                math.isfinite(state.timestamp) and
+                -0.1 <= self.get_clock().now().nanoseconds / 1e9 - state.timestamp <= 1.0)
+
+    def _joint_feedback_valid(self, state) -> bool:
+        return (self._feedback_recent(state) and len(state.msg) == self.arm_joint_count and
+                all(math.isfinite(v) for v in state.msg))
+
+    def _stop_control(self):
+        self.control_enabled = False
+        self._stop_pending = True
+        # No measured pose, enable check or firmware mode switch is required.
+        self.agx_arm.electronic_emergency_stop()
+        if self.agx_arm.has_comm_error():
+            raise RuntimeError(f"Stop transport error: {self.agx_arm.get_comm_error()}")
+        self._last_joint_command = None
+        self._stop_pending = False
+
+    def _check_command_timeout(self):
+        # Same callback group as commands/services: no stop/command race.
+        if ((self.control_enabled or self._stop_pending) and self._last_joint_command is not None and
+                time.monotonic() - self._last_joint_command > 1.0):
+            self._control_stop_callback(None, Trigger.Response())
+            self.get_logger().error("Joint command stream timed out; stop requested",
+                                    throttle_duration_sec=5.0)
+
+    def _control_stop_callback(self, request, response):
+        try:
+            self._stop_control()
+            response.success = True
+            response.message = "Stop packet sent; physical stop is not confirmed"
+        except Exception as error:
+            self._last_joint_command = time.monotonic()  # Retry delivery after a full timeout interval.
+            response.message = str(error)
+            self.get_logger().error(f"Stop packet failed: {error}", throttle_duration_sec=5.0)
+        return response
 
     def _check_can_control(self) -> bool:
         if not self.control_ready:
@@ -428,10 +468,11 @@ class AgxArmRosNode(Node):
             # joint state stream is available.
             return False
         if not self._check_arm_ready():
-            self.get_logger().warn("Agx_arm is not connected, cannot control")
+            self.get_logger().warn("No recent valid joint feedback; control deferred",
+                                   throttle_duration_sec=5.0)
             return False
         if not self.enable_flag:
-            self.get_logger().warn("Agx_arm is not enabled, cannot control")
+            self.get_logger().warn("Agx_arm is not enabled, cannot control", throttle_duration_sec=5.0)
             return False
         if not self.control_enabled:
             if not self._control_gate_block_logged:
@@ -441,6 +482,7 @@ class AgxArmRosNode(Node):
                 self._control_gate_block_logged = True
             return False
         self._control_gate_block_logged = False
+        self._last_joint_command = None  # Explicit non-stream commands disarm the stream watchdog.
         return True
 
     def _create_pose_cmd(self, pose: Pose) -> list:
@@ -482,7 +524,7 @@ class AgxArmRosNode(Node):
             wait_start = time.time()
             while time.time() - wait_start < timeout * 6:
                 state = self.agx_arm.get_driver_states(1)
-                if state is not None and getattr(state, "hz", 0) > 0:
+                if self._feedback_recent(state):
                     break
                 time.sleep(0.2)
             else:
@@ -510,7 +552,7 @@ class AgxArmRosNode(Node):
                 f"Not all joints are {action_name}d after {action_name}ing the arm"
             )
         
-        return True
+        return all_joints_in_target_status
 
     ### publisher thread
     def _publish_thread(self):
@@ -519,11 +561,11 @@ class AgxArmRosNode(Node):
 
         # publishing loop
         while rclpy.ok():
-            if self.agx_arm.is_ok():
+            if self._check_arm_ready():
                 if not feedback_alive:
                     feedback_alive = True
                     self.get_logger().info("Agx_arm feedback recovered, restoring state")
-                    if self.enable_flag:
+                    if self.enable_flag and self.control_enabled:
                         self.get_logger().info("Re-enabling the arm after feedback recovery")
                         for attempt in range(1, 6):
                             if self._enable_arm(True, timeout=self.enable_timeout):
@@ -536,7 +578,7 @@ class AgxArmRosNode(Node):
                 if not self.control_ready:
                     self.control_ready = True
                     if not self._control_ready_logged:
-                        self.get_logger().info("Agx_arm feedback is ready, control is now enabled")
+                        self.get_logger().info("Agx_arm feedback is ready")
                         self._control_ready_logged = True
                 self._publish_joint_states()
                 self._publish_pose()
@@ -591,7 +633,7 @@ class AgxArmRosNode(Node):
 
     def _publish_joint_states(self):
         joint_states = self.agx_arm.get_joint_angles()
-        if joint_states is None or joint_states.hz <= 0:
+        if not self._joint_feedback_valid(joint_states):
             return
 
         velocitys = []
@@ -622,7 +664,7 @@ class AgxArmRosNode(Node):
 
     def _publish_pose(self):
         flange_pose = self.agx_arm.get_flange_pose()
-        if flange_pose is None or flange_pose.hz <= 0:
+        if not self._feedback_recent(flange_pose):
             return
         
         tcp_pose = self.agx_arm.get_flange2tcp_pose(flange_pose.msg)
@@ -898,6 +940,8 @@ class AgxArmRosNode(Node):
         if not self._check_can_control():
             return
 
+        self._last_joint_command = time.monotonic()
+
         joint_pos = {
             name: self._safe_get_value(msg.position, idx)
             for idx, name in enumerate(msg.name)
@@ -1159,7 +1203,12 @@ class AgxArmRosNode(Node):
         return response
 
     def _control_gate_callback(self, request, response):
+        if request.data and self._stop_pending:
+            response.message = "Stop packet delivery is pending"
+            return response
         self.control_enabled = request.data
+        if not request.data and not self._stop_pending:
+            self._last_joint_command = None
         self._control_gate_block_logged = False
         state = "opened" if request.data else "closed"
         response.success = True
@@ -1168,30 +1217,10 @@ class AgxArmRosNode(Node):
         return response
 
     def _emergency_stop_callback(self, request, response):
-        """Emergency stop: use is_switch_seamlessly flag to decide MIT vs move_j."""
-        try:
-            if not self._check_arm_ready():
-                self.get_logger().warn("Agx_arm is not connected, cannot perform emergency stop")
-                return response
-            if not self.enable_flag:
-                self.get_logger().warn("Agx_arm is not enabled, cannot perform emergency stop")
-                return response
-
-            js = self.agx_arm.get_joint_angles()
-            if js is None or js.hz <= 0:
-                self.get_logger().warn("No valid joint angles, cannot perform emergency stop")
-                return response
-
-            q = list(js.msg)
-            if not self.is_switch_seamlessly:
-                self.agx_arm.move_js(q)
-                self.is_mit_mode = True
-            else:
-                self.agx_arm.move_j(q)
-                self.is_mit_mode = False
-            self.get_logger().info(f"Emergency stop command sent to {self.arm_type}")
-        except Exception as e:
-            self.get_logger().error(f"Emergency stop failed: {e}")
+        # Preserve the Empty service; callers needing acknowledgment use control_stop.
+        result = self._control_stop_callback(request, Trigger.Response())
+        if result.success:
+            self.get_logger().info(result.message)
         return response
 
     def _exit_teach_mode_callback(self, request, response):

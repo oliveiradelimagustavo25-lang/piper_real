@@ -17,6 +17,7 @@
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 namespace my_robot_hardware
 {
@@ -30,6 +31,7 @@ class AgxTopicSystem : public hardware_interface::SystemInterface
   using Clock = std::chrono::steady_clock;
   using List = controller_manager_msgs::srv::ListControllers;
   using Switch = controller_manager_msgs::srv::SwitchController;
+  using Stop = std_srvs::srv::Trigger;
   enum class State {Inactive, Active, Faulted, Stopped};
 
 public:
@@ -53,7 +55,7 @@ public:
           if (!std::isfinite(value) || value <= 0) {throw std::invalid_argument(key);}
           return value;
         };
-      feedback_timeout_ = number("feedback_timeout", 0.5);
+      feedback_timeout_ = number("feedback_timeout", 1.0);
       startup_timeout_ = number("startup_timeout", 40.0);
       for (const auto & joint : info.joints) {
         if (joint.command_interfaces.size() != 1 ||
@@ -83,6 +85,7 @@ public:
       publisher_ = node_->create_publisher<JointState>("control/joint_states", 1);
       list_client_ = node_->create_client<List>("controller_manager/list_controllers");
       switch_client_ = node_->create_client<Switch>("controller_manager/switch_controller");
+      stop_client_ = node_->create_client<Stop>("control_stop");
       spin_thread_ = std::thread(
         [this]() {
           auto retry_at = Clock::now();
@@ -90,7 +93,7 @@ public:
             executor_.spin_once(std::chrono::milliseconds(50));
             if (state_ == State::Faulted && Clock::now() >= retry_at) {
               stopControllers();
-              retry_at = Clock::now() + std::chrono::milliseconds(100);
+              retry_at = Clock::now() + std::chrono::seconds(1);
             }
           }
         });
@@ -132,6 +135,7 @@ public:
         // Never initialize a real arm from mock zero values. Keep exported pointers stable.
         std::copy(positions_.begin(), positions_.end(), commands_.begin());
         state_ = State::Active;
+        stop_sent_ = false;
         RCLCPP_INFO(node_->get_logger(), "Commands synchronized to actual joint feedback");
         return CallbackReturn::SUCCESS;
       }
@@ -161,7 +165,7 @@ public:
       // Retain interface ownership only while stopping its controllers. Humble
       // rejects stop requests after read(ERROR) has made those interfaces unavailable.
       state_ = State::Faulted;
-      RCLCPP_ERROR(node_->get_logger(), "AGX feedback lost/stale; stopping command publication");
+      reportStale();
     }
     return Return::OK;
   }
@@ -169,11 +173,14 @@ public:
   Return write(const rclcpp::Time &, const rclcpp::Duration &) override
   {
     if (state_ != State::Active) {return Return::OK;}
-    if (!fresh() || !std::all_of(
-        commands_.begin(), commands_.end(),
-        [](double v) {return std::isfinite(v);}))
-    {
+    if (!fresh()) {
       state_ = State::Faulted;
+      reportStale();
+      return Return::OK;
+    }
+    if (!std::all_of(commands_.begin(), commands_.end(), [](double v) {return std::isfinite(v);})) {
+      state_ = State::Faulted;
+      RCLCPP_ERROR(node_->get_logger(), "Non-finite command; stopping command publication");
       return Return::OK;
     }
     JointState msg;
@@ -185,6 +192,16 @@ public:
   }
 
 private:
+  void reportStale() const
+  {
+    std::lock_guard<std::mutex> lock(feedback_mutex_);
+    const double message_age = (node_->now().nanoseconds() - last_stamp_) / 1e9;
+    const double receipt_age = std::chrono::duration<double>(Clock::now() - received_at_).count();
+    RCLCPP_ERROR(node_->get_logger(),
+      "AGX feedback stale: message age %.3f s, receipt age %.3f s, limit %.3f s; last rejected: %s",
+      message_age, receipt_age, feedback_timeout_, rejected_.load());
+  }
+
   void copyState()
   {
     std::lock_guard<std::mutex> lock(feedback_mutex_);
@@ -205,16 +222,19 @@ private:
   {
     const auto stamp = rclcpp::Time(msg.header.stamp).nanoseconds();
     const double age = (node_->now().nanoseconds() - stamp) / 1e9;
-    if (stamp <= last_stamp_ || age < -0.1 || age > feedback_timeout_ ||
-      msg.position.size() != msg.name.size() || msg.velocity.size() != msg.name.size() ||
+    if (stamp <= last_stamp_) {rejected_ = "timestamp not increasing"; return;}
+    if (age < -0.1 || age > feedback_timeout_) {rejected_ = "timestamp outside allowed age"; return;}
+    if (msg.position.size() != msg.name.size() || msg.velocity.size() != msg.name.size() ||
       std::set<std::string>(msg.name.begin(), msg.name.end()).size() != msg.name.size())
-    {return;}
+    {rejected_ = "invalid array sizes or duplicate joints"; return;}
     std::vector<double> positions, velocities;
     for (const auto & joint : info_.joints) {
       const auto found = std::find(msg.name.begin(), msg.name.end(), joint.name);
-      if (found == msg.name.end()) {return;}
+      if (found == msg.name.end()) {rejected_ = "required joint missing"; return;}
       const auto index = static_cast<std::size_t>(found - msg.name.begin());
-      if (!std::isfinite(msg.position[index]) || !std::isfinite(msg.velocity[index])) {return;}
+      if (!std::isfinite(msg.position[index]) || !std::isfinite(msg.velocity[index])) {
+        rejected_ = "non-finite joint feedback"; return;
+      }
       positions.push_back(msg.position[index]);
       velocities.push_back(msg.velocity[index]);
     }
@@ -224,6 +244,7 @@ private:
     cached_velocities_ = std::move(velocities);
     last_stamp_ = stamp;
     received_at_ = Clock::now();
+    rejected_ = "none since last valid feedback";
   }
 
   template<typename Service>
@@ -244,10 +265,16 @@ private:
   {
     // Runs on the private I/O thread, never on the controller update thread.
     // Keep interface ownership until affected controllers stop (Humble requirement).
+    if (!stop_sent_) {
+      const auto stopped = call<Stop>(stop_client_, std::make_shared<Stop::Request>());
+      stop_sent_ = stopped && stopped->success;
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "Hardware stop packet %s; physical standstill unconfirmed", stop_sent_ ? "sent" : "unconfirmed");
+    }
     const auto listed = call<List>(list_client_, std::make_shared<List::Request>());
     if (!listed) {return;}
     auto request = std::make_shared<Switch::Request>();
-    request->strictness = Switch::Request::BEST_EFFORT;
+    request->strictness = Switch::Request::STRICT;
     request->timeout.sec = 2;
     for (const auto & controller : listed->controller) {
       if (controller.state != "active") {continue;}
@@ -259,10 +286,12 @@ private:
         });
       if (owns) {request->deactivate_controllers.push_back(controller.name);}
     }
-    if (request->deactivate_controllers.empty()) {state_ = State::Stopped; return;}
+    if (request->deactivate_controllers.empty()) {
+      if (stop_sent_) {state_ = State::Stopped;}
+      return;
+    }
     const auto switched = call<Switch>(switch_client_, request);
     if (switched && switched->ok) {
-      state_ = State::Stopped;
       RCLCPP_WARN(
         node_->get_logger(),
         "Affected controllers deactivated; manual recovery required");
@@ -279,11 +308,14 @@ private:
   rclcpp::Publisher<JointState>::SharedPtr publisher_;
   rclcpp::Client<List>::SharedPtr list_client_;
   rclcpp::Client<Switch>::SharedPtr switch_client_;
+  rclcpp::Client<Stop>::SharedPtr stop_client_;
+  std::atomic<bool> stop_sent_{false};
   std::thread spin_thread_;
   mutable std::mutex feedback_mutex_;
   std::vector<double> cached_positions_, cached_velocities_;
   std::vector<double> positions_, velocities_, commands_;
-  double feedback_timeout_ = 0.5, startup_timeout_ = 40.0;
+  double feedback_timeout_ = 1.0, startup_timeout_ = 40.0;
+  std::atomic<const char *> rejected_{"none since last valid feedback"};
   int64_t last_stamp_ = 0;
   Clock::time_point received_at_;
   std::atomic<State> state_{State::Inactive};

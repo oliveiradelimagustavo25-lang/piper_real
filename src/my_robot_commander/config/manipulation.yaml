@@ -28,7 +28,7 @@ pick_place_executor:
 
     approach_distance: 0.04      # 物块上方的预抓取距离，m
     lift_distance: 0.06          # 闭爪后先沿 Z 轴直线抬升的距离，m
-    transport_height: 0.08       # 随后搬运目标的最低 TCP 高度（非原地直线抬升终点），m
+    transport_height: 0.08       # 优先搬运 TCP 高度；规划失败时可降低，但保留抬升和放置前的间距，m
     release_clearance: 0.002     # 放置时让物块底面略高于目标支撑面，m
     retreat_distance: 0.04       # 松开后向上撤离距离，m
 

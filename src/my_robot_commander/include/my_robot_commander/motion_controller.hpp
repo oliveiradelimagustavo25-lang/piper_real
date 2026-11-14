@@ -10,6 +10,7 @@
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <my_robot_interface/msg/failure.hpp>
 
 namespace my_robot_commander
 {
@@ -34,6 +35,7 @@ public:
     double velocity_scaling = 0.2;
     double acceleration_scaling = 0.2;
     double planning_time = 5.0;
+    double startup_timeout = 60.0;  // s，连接 MoveIt 服务的总预算。
     double cartesian_step = 0.005;  // m，直线路径插值步长。
     double execution_timeout = 120.0;  // s，单个轨迹的执行上限。
     double cancel_timeout = 5.0;       // s，取消后等待最终结果的上限。
@@ -58,9 +60,10 @@ public:
   bool moveGripperToWidth(double width);  // 绝对总开口，0.04 表示 40 mm。
   std::pair<double, double> gripperWidthLimits() const;  // MoveIt 模型中的总开口范围，m。
   void validateLinks(const std::vector<std::string> & links) const;
-  std::string lastError() const;
+  std::string lastError() const;  // Compatibility view of lastFailure().detail.
+  my_robot_interface::msg::Failure lastFailure() const;
   bool lastFailureBeforeExecution() const;  // 最近一次失败是否发生在轨迹下发前。
-  bool executionStateKnown() const;  // false 时禁止新运动和场景清理，需人工确认恢复。
+  bool executionStateKnown() const;  // 未决 Goal 禁止新运动；晚到终态可完成对账，不自动续跑。
   bool openGripper();
   bool closeGripper();
 

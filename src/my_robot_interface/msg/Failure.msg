@@ -1,0 +1,58 @@
+# 跨进程失败事实；默认未知，成功时显式填 NONE。旧编号 0–3 保留。
+uint16 NONE=0
+uint16 TARGET_UNAVAILABLE=1
+uint16 EXECUTION_FAILED=2
+uint16 RECOVERY_REQUIRED=3
+uint16 OBSERVATION_STALE=4
+uint16 TF_UNAVAILABLE=5
+uint16 DEPENDENCY_UNAVAILABLE=6
+uint16 PLAN_FAILED=7
+uint16 INPUT_INVALID=8
+uint16 EXECUTION_TIMEOUT=9
+uint16 EXECUTION_RESULT_UNKNOWN=10
+uint16 FEEDBACK_STALE=11
+uint16 SCENE_INCONSISTENT=12
+uint16 RECOVERY_FAILED=13
+uint16 UNCLASSIFIED=65535
+uint16 code 65535
+
+uint8 UNKNOWN=0
+uint8 MOTION=1
+uint8 SCENE=2
+uint8 EXECUTOR=3
+uint8 PLANNER=4
+uint8 PERCEPTION=5
+uint8 HARDWARE=6
+uint8 CLIENT=7
+uint8 origin
+
+uint8 VALIDATE=1
+uint8 OBSERVE=2
+uint8 PREPARE=3
+uint8 PLAN=4
+uint8 OPEN=5
+uint8 PREGRASP=6
+uint8 DESCEND=7
+uint8 CLOSE=8
+uint8 LIFT=9
+uint8 TRANSFER=10
+uint8 PLACE=11
+uint8 RELEASE=12
+uint8 RETREAT=13
+uint8 CLEANUP=14
+uint8 stage
+
+string object_id
+bool target_specific
+uint8 NOT_SENT=1
+uint8 IN_FLIGHT=2
+uint8 TERMINAL=3
+uint8 command_state
+# 流程持物责任，不是夹持传感器的检测结论。
+uint8 CLEAR=1
+uint8 MAY_HOLD=2
+uint8 payload_state
+uint8 CONSISTENT=1
+uint8 UNCERTAIN=2
+uint8 scene_state
+string detail

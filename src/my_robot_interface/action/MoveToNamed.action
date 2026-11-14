@@ -3,4 +3,5 @@ string target
 ---
 bool success
 string message
+my_robot_interface/Failure failure
 ---
